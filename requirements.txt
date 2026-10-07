@@ -1,0 +1,11 @@
+requests
+beautifulsoup4
+pymupdf
+langchain-text-splitters
+fastembed
+chromadb
+python-dotenv
+streamlit
+tqdm
+fastapi
+uvicorn[standard]
