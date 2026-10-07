@@ -64,7 +64,14 @@ def retrieve(question: str, top_k: int = TOP_K) -> list[dict]:
     return hits
 
 
-LANGUAGE_NAMES = {"fr": "francais", "en": "anglais", "wo": "wolof"}
+LANGUAGE_NAMES = {
+    "fr": "francais",
+    "en": "anglais",
+    "wo": "wolof",
+    "ff": "pulaar (peul du Senegal)",
+    "srr": "serere (seereer)",
+    "dyo": "diola (joola-fonyi)",
+}
 
 
 def build_prompt(question: str, hits: list[dict], language: str = "fr") -> str:

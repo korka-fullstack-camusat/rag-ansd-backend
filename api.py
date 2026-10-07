@@ -58,7 +58,7 @@ app.add_middleware(
 
 class QueryRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
-    language: Literal["fr", "wo", "en"] = "fr"
+    language: Literal["fr", "wo", "en", "ff", "srr", "dyo"] = "fr"
 
 
 class Citation(BaseModel):
