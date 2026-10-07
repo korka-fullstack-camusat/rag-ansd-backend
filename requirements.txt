@@ -9,3 +9,4 @@ streamlit
 tqdm
 fastapi
 uvicorn[standard]
+redis

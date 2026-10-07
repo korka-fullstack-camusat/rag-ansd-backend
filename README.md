@@ -113,3 +113,36 @@ uvicorn api:app --reload --port 8000   # docs : http://localhost:8000/docs
 
 ou en Docker : `docker compose up --build`. Variable `CORS_ORIGINS` : URL(s)
 du frontend autorisées. Guide complet de lancement : `../../LANCEMENT.md`.
+
+## Montée en charge
+
+Ce qui rend le backend capable de tenir une forte charge :
+
+| Mécanisme | Effet |
+|---|---|
+| Cache des réponses (`cache.py`, Redis) | une question déjà posée (même langue, à la casse/accents près) est servie sans appeler le modèle |
+| Regroupement des questions identiques | 500 questions identiques simultanées → 1 à 2 appels au modèle |
+| Appels au modèle asynchrones (`httpx`, pool de connexions) | un processus gère des milliers de requêtes en attente ; nouvelles tentatives sur 429/5xx |
+| Plusieurs processus (`WEB_CONCURRENCY`) | un par cœur CPU environ (~600 Mo de RAM chacun, modèle d'embedding inclus) |
+| Limitation de débit | `RATE_LIMIT_PER_MINUTE` par utilisateur, `RATE_LIMIT_IP_PER_MINUTE` par IP |
+| Journal d'utilisation en arrière-plan | écritures groupées, SQLite en WAL ; agrégats du tableau de bord calculés en SQL et mis en cache 30 s |
+
+Mesures sur un MacBook Air (Docker, 1 instance, 4 processus) :
+
+| Charge | Avant | Après |
+|---|---|---|
+| Question déjà posée (500 en parallèle) | ~11 req/s, 2 s | ~4 450 req/s, 56 ms (médiane) |
+| `/api/sources` | 221 req/s | ~9 300 req/s |
+| Question nouvelle × 500 simultanées | 500 appels au modèle | 2 appels au modèle |
+
+Plusieurs instances derrière Nginx (Redis partagé) :
+
+```bash
+docker compose -f docker-compose.scale.yml up --build -d
+docker compose -f docker-compose.scale.yml up -d --scale backend=6
+```
+
+Limites de cette configuration (à traiter en production à très grande échelle) :
+les questions *nouvelles* restent bornées par les quotas du fournisseur du
+modèle ; le journal SQLite et l'index Chroma sont locaux à une machine (passer
+à PostgreSQL et à une base vectorielle partagée pour plusieurs serveurs).
