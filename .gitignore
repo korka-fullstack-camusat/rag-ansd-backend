@@ -2,4 +2,6 @@
 .venv/
 __pycache__/
 .claude/
-storage/analytics.sqlite3*
+storage/
+data/
+

@@ -10,3 +10,6 @@ tqdm
 fastapi
 uvicorn[standard]
 redis
+httpx
+python-multipart
+imageio-ffmpeg

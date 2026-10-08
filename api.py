@@ -6,12 +6,14 @@ Les formes de reponse suivent exactement les types TypeScript du frontend
     uvicorn api:app --host 0.0.0.0 --port 8000
 """
 
+import asyncio
 import csv
 import hashlib
 import logging
 import hmac
 import os
 import re
+import threading
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
@@ -19,10 +21,11 @@ from typing import Literal
 
 import analytics
 from cache import normalize, store
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+import voice
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, Response
 from pydantic import BaseModel, Field
 
 from config import MANIFEST_PATH, TOP_K
@@ -33,6 +36,8 @@ from rag import (
     aexplain,
     ashort_title,
     get_collection,
+    corpus_index,
+    corpus_reply,
     acondense,
     get_embedder,
     retrieve,
@@ -80,6 +85,10 @@ async def lifespan(_app: FastAPI):
     # demarrage, pas a la premiere question d'un utilisateur.
     await run_in_threadpool(lambda: list(get_embedder().embed(["warmup"])))
     await run_in_threadpool(get_collection)
+    # Index du corpus (titres, URL, sigles) : environ 2 minutes la premiere fois,
+    # puis lu depuis storage/corpus_cache.json. Lance en arriere-plan pour ne pas
+    # retarder le demarrage ; les requetes qui en dependent attendent la fin.
+    threading.Thread(target=corpus_index, daemon=True).start()
     yield
 
 
@@ -181,10 +190,8 @@ def read_manifest() -> list[dict]:
 
 
 def indexed_urls() -> set[str]:
-    collection = get_collection()
-    if collection.count() == 0:
-        return set()
-    return {m["url"] for m in collection.get(include=["metadatas"])["metadatas"] if m.get("url")}
+    """URL des documents indexes, relues seulement si le nombre de fragments change."""
+    return corpus_index()["urls"]
 
 
 _NUMBER_RE = re.compile(r"(?<![\w.])(?:p\.\s*|page\s+|source\s+)?\d+(?:[.,]\d+)*", re.IGNORECASE)
@@ -240,14 +247,16 @@ def corpus_version() -> int:
     return _corpus["version"]
 
 
-async def aretrieve(question: str, prefer: list[tuple[str, int]] | None = None) -> list[dict]:
+async def aretrieve(
+    question: str, prefer: list[tuple[str, int]] | None = None, top_k: int = TOP_K
+) -> list[dict]:
     """Recherche vectorielle hors de la boucle d'evenements, avec un petit
     cache par processus (la meme question sert a la reponse puis au « Voir plus »)."""
-    key = f"{corpus_version()}:{normalize(question)}:{sorted(set(prefer or []))}"
+    key = f"{corpus_version()}:{normalize(question)}:{sorted(set(prefer or []))}:{top_k}"
     if key in _retrieval_cache:
         _retrieval_cache.move_to_end(key)
         return _retrieval_cache[key]
-    hits = await run_in_threadpool(retrieve, question, TOP_K, prefer)
+    hits = await run_in_threadpool(retrieve, question, top_k, prefer)
     _retrieval_cache[key] = hits
     while len(_retrieval_cache) > 2000:
         _retrieval_cache.popitem(last=False)
@@ -298,12 +307,62 @@ def _build_sources() -> list[SourceDocument]:
     ]
 
 
+async def _to_french(text: str, timeout: float = 25) -> str:
+    """Wolof -> francais ; le texte tel quel s'il n'est pas du wolof (le service traduirait
+    alors dans l'autre sens) ou si la traduction echoue (la recherche sera moins bonne, mais
+    l'utilisateur obtient une reponse)."""
+    if not voice.looks_wolof(text):
+        return text
+    try:
+        return await voice.translate(text, "wo", "fr", timeout=timeout)
+    except voice.VoiceError:
+        return text
+
+
 @app.post("/api/query", response_model=QueryResponse)
 async def query(
     req: QueryRequest,
     request: Request,
     x_client_id: str | None = Header(default=None),
     x_session_id: str | None = Header(default=None),
+) -> QueryResponse:
+    """Point d'entree. Anglais et francais : traites directement. Wolof : la question et
+    l'historique sont traduits en francais (Soynade), traites comme une question francaise
+    (meme recherche, meme cache), puis la reponse est traduite en wolof."""
+    if req.language != "wo":
+        return await _query(req, request, x_client_id, x_session_id)
+    chat = small_talk_reply(req.question, "wo")  # « Nanga def ? », « Jërëjëf »… sont reconnus tels quels
+    if chat:
+        await enforce_rate_limit(request, x_client_id)
+        analytics.log_event("chat", client_id=x_client_id, session_id=x_session_id, question=req.question, language="wo")
+        # Reponse ecrite en wolof si elle existe ; sinon le francais, traduit.
+        if chat == small_talk_reply(req.question, "fr"):
+            chat = await voice.to_wolof(chat)
+        return QueryResponse(
+            question=req.question, language="wo", kind="chat", answered=False, answer=chat,
+            citations=[], sources_used=[], model="", usage=Usage(),
+        )
+    question_fr, *history_fr = await asyncio.gather(
+        _to_french(req.question),
+        *[_to_french(t.answer, timeout=10) for t in req.history[-2:]],
+        *[_to_french(t.question, timeout=10) for t in req.history[-2:]],
+    )
+    turns = req.history[-2:]
+    history = [
+        HistoryTurn(question=history_fr[len(turns) + i], answer=history_fr[i], sources=t.sources)
+        for i, t in enumerate(turns)
+    ]
+    fr_req = req.model_copy(update={"language": "fr", "question": question_fr, "history": history})
+    resp = await _query(fr_req, request, x_client_id, x_session_id)
+    answer = await voice.to_wolof(resp.answer) if resp.answer else resp.answer
+    return resp.model_copy(update={"language": "wo", "question": req.question, "answer": answer})
+
+
+async def _query(
+    req: QueryRequest,
+    request: Request,
+    x_client_id: str | None,
+    x_session_id: str | None,
 ) -> QueryResponse:
     """Repond a la question (depuis le cache si elle a deja ete posee) et
     journalise l'utilisation (tableau de bord admin)."""
@@ -323,6 +382,17 @@ async def query(
             citations=[], sources_used=[], model="", usage=Usage(),
         )
     try:
+        about_corpus = await run_in_threadpool(corpus_reply, question, req.language)
+    except Exception:
+        logger.exception("corpus reply failed")
+        about_corpus = None
+    if about_corpus:
+        analytics.log_event("chat", client_id=x_client_id, session_id=x_session_id, question=question, language=req.language)
+        return QueryResponse(
+            question=question, language=req.language, kind="chat", answered=False, answer=about_corpus,
+            citations=[], sources_used=[], model="", usage=Usage(),
+        )
+    try:
         history = [t.model_dump() for t in req.history if t.answer.strip()][-2:]
         standalone = question
         clause = format_only_clause(question) if history else None
@@ -339,12 +409,20 @@ async def query(
                 standalone = await acondense(question, history)
             except Exception:
                 logger.warning("reformulation impossible, question telle quelle", exc_info=True)
-        prefer = [(src["title"], src["page"]) for t in history[-1:] for src in t["sources"] if src["page"] is not None]
-        previous = history[-1]["answer"] if history else None
+        # Les sources et la reponse precedentes ne servent QUE si la question est une suite
+        # (mise en forme, autre periode, ou reformulee a partir de l'historique). Une question
+        # sur un autre sujet repart de zero : sinon les pages du tour precedent sont forcees
+        # dans les resultats et affichees comme sources de la nouvelle reponse.
+        follow_up = bool(clause or periods) or normalize(standalone) != normalize(question)
+        prefer = (
+            [(src["title"], src["page"]) for t in history[-1:] for src in t["sources"] if src["page"] is not None]
+            if follow_up else []
+        )
+        previous = history[-1]["answer"] if history and follow_up else None
         # La reponse precedente fait partie de la cle : « mets ca en tableau » apres deux
         # reponses differentes ne doit pas resservir la meme reponse en cache.
         prev_key = hashlib.sha1(previous.encode()).hexdigest()[:12] if previous else "-"
-        key = f"answer:v13:{corpus_version()}:{req.language}:{normalize(standalone)}:{sorted(set(prefer))}:{prev_key}"
+        key = f"answer:v17:{corpus_version()}:{req.language}:{normalize(standalone)}:{sorted(set(prefer))}:{prev_key}"
         data, cached = await store.cached(
             key,
             lambda: _answer(standalone, req.language, prefer, previous, temperature=0.6 if req.regenerate else 0.2),
@@ -374,6 +452,7 @@ async def query(
 
 
 YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
+YEAR_CANDIDATES_FACTOR = 8  # candidats recuperes avant filtre par annee = TOP_K x 8
 
 
 def filter_by_years(question: str, hits: list[dict]) -> list[dict]:
@@ -402,15 +481,28 @@ def _is_empty_answer(answer: str, question: str) -> bool:
     ]
 
 
-def _fallback_sources(answer: str, hits: list[dict]) -> list[int]:
-    """Si le modele n'a pas indique ses sources : les extraits qui contiennent
-    les chiffres de la reponse, a defaut le plus pertinent."""
-    figures = _figures(answer)
-    matching = [
-        i for i, h in enumerate(hits)
-        if figures and any(f in _normalize_numbers(h["text"]) for f in figures)
-    ]
-    return matching[:3] or [0]
+_YEAR_ONLY_RE = re.compile(r"(?:19|20)\d{2}")
+
+
+def pick_sources(answer: str, hits: list[dict], used: list[int]) -> list[int]:
+    """Indices des extraits a afficher comme sources de la reponse.
+
+    Une source n'est affichee que si son texte contient reellement un chiffre de la
+    reponse : les annees sont ignorees (« 2010 » apparait dans n'importe quel
+    document de la serie) et le chiffre doit etre un nombre entier dans l'extrait
+    (« 12 » ne correspond pas a « 2012 »). Les extraits cites par le modele passent
+    en premier. Reponse sans chiffre propre ou rien de verifiable : on s'en tient a
+    ce que le modele a indique, a defaut a l'extrait le plus pertinent."""
+    figures = [f for f in _figures(answer) if not _YEAR_ONLY_RE.fullmatch(f)]
+    if not figures:
+        return used or [0]
+    patterns = [re.compile(rf"(?<![\d,.]){re.escape(f)}(?!\d)") for f in figures]
+    texts = [_normalize_numbers(h["text"]) for h in hits]
+    supporting = [i for i, t in enumerate(texts) if any(p.search(t) for p in patterns)]
+    if not supporting:
+        return used or [0]
+    ordered = [i for i in used if i in supporting] + [i for i in supporting if i not in used]
+    return ordered[:3]
 
 
 async def _answer(
@@ -430,7 +522,10 @@ async def _answer(
     if await run_in_threadpool(unknown_acronyms, question):
         return no_data
     try:
-        hits = filter_by_years(question, await aretrieve(question, prefer))
+        # Question datee : on cherche plus large avant de filtrer par annee, sinon les
+        # 6 meilleurs extraits (souvent d'autres annees d'une meme serie) ne laissent rien.
+        wide = TOP_K * YEAR_CANDIDATES_FACTOR if YEAR_RE.search(question) else TOP_K
+        hits = filter_by_years(question, await aretrieve(question, prefer, wide))[:TOP_K]
     except Exception:
         logger.exception("retrieval failed")
         raise HTTPException(status_code=500, detail=GENERIC_ERROR_MESSAGE)
@@ -451,7 +546,7 @@ async def _answer(
 
     verified = figures_found_in_context(answer, hits, question)
     # Sources affichees : seulement les extraits reellement utilises pour repondre.
-    cited = [hits[i] for i in (used or _fallback_sources(answer, hits))]
+    cited = [hits[i] for i in pick_sources(answer, hits, used)]
     cited = list({(h["source"], h["page"]): h for h in cited}.values())
     citations = [
         Citation(
@@ -633,14 +728,36 @@ def admin_questions(
     )
 
 
-VOICE_UNAVAILABLE = "Le mode vocal n'est pas encore disponible sur ce serveur."
+class SpeakRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=8000)
+    language: Literal["fr", "wo", "en", "ff", "srr", "dyo"] = "wo"
 
 
 @app.post("/api/voice/transcribe")
-def voice_transcribe() -> None:
-    raise HTTPException(status_code=501, detail=VOICE_UNAVAILABLE)
+async def voice_transcribe(
+    request: Request,
+    audio: UploadFile = File(...),
+    language: str = Form("wo"),
+    x_client_id: str | None = Header(default=None),
+) -> dict:
+    """Question posee a voix haute -> texte (Soynade, voir voice.py)."""
+    await enforce_rate_limit(request, x_client_id)
+    try:
+        text = await voice.transcribe(await audio.read(), audio.filename or "", language)
+    except voice.VoiceError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail)
+    return {"text": text}
 
 
 @app.post("/api/voice/speak")
-def voice_speak() -> None:
-    raise HTTPException(status_code=501, detail=VOICE_UNAVAILABLE)
+async def voice_speak(
+    req: SpeakRequest, request: Request, x_client_id: str | None = Header(default=None)
+) -> Response:
+    """Lecture a voix haute d'une reponse (Soynade, voir voice.py). 501 pour les langues
+    sans voix : le frontend retombe alors sur la synthese du navigateur."""
+    await enforce_rate_limit(request, x_client_id)
+    try:
+        content, media_type = await voice.synthesize(req.text, req.language)
+    except voice.VoiceError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail)
+    return Response(content=content, media_type=media_type)
