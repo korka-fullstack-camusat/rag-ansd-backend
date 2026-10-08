@@ -4,4 +4,5 @@ __pycache__/
 .claude/
 storage/
 data/
-
+.DS_Store
+*.tar.gz
