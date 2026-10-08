@@ -33,8 +33,16 @@ from rag import (
     aexplain,
     ashort_title,
     get_collection,
+    acondense,
     get_embedder,
     retrieve,
+    format_only_clause,
+    period_only,
+    with_period,
+    small_talk_reply,
+    split_used_sources,
+    with_format,
+    unknown_acronyms,
 )
 
 logger = logging.getLogger("ansd-api")
@@ -86,8 +94,24 @@ app.add_middleware(
 
 # ------------------------------------------------------------------ schemas
 
+class SourceRef(BaseModel):
+    title: str = Field(max_length=300)
+    page: int | None = None
+
+
+class HistoryTurn(BaseModel):
+    """Echange precedent de la discussion (question de suite : « et ces chiffres ? »)."""
+    question: str = Field(max_length=2000)
+    answer: str = Field(max_length=4000)
+    sources: list[SourceRef] = Field(default_factory=list, max_length=6)
+
+
 class QueryRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
+    # « Relancer » : nouvelle reponse, sans resservir celle en cache.
+    regenerate: bool = False
+    # Derniers echanges avec leurs sources (seuls les deux derniers sont utilises).
+    history: list[HistoryTurn] = Field(default_factory=list, max_length=20)
     language: Literal["fr", "wo", "en", "ff", "srr", "dyo"] = "fr"
     # Comment la question a ete posee (statistiques d'usage uniquement).
     mode: Literal["text", "voice"] = "text"
@@ -96,6 +120,8 @@ class QueryRequest(BaseModel):
 class Citation(BaseModel):
     document_id: str
     document_title: str
+    # Adresse officielle du PDF sur ansd.sn (lien partageable, ex. dans une copie).
+    url: str | None = None
     quote: str
     page_start: int | None
     page_end: int | None
@@ -110,6 +136,12 @@ class Usage(BaseModel):
 
 class QueryResponse(BaseModel):
     question: str
+    # answer : reponse tiree des publications ; no_data : rien dans le corpus ;
+    # chat : conversation courante (« bonjour », « merci »…), sans recherche.
+    kind: Literal["answer", "no_data", "chat"] = "answer"
+    # Question reformulee de maniere autonome (questions de suite), utilisee pour
+    # la recherche ; reprise par « Voir plus ».
+    standalone_question: str | None = None
     language: str
     answered: bool
     answer: str
@@ -208,14 +240,14 @@ def corpus_version() -> int:
     return _corpus["version"]
 
 
-async def aretrieve(question: str) -> list[dict]:
+async def aretrieve(question: str, prefer: list[tuple[str, int]] | None = None) -> list[dict]:
     """Recherche vectorielle hors de la boucle d'evenements, avec un petit
     cache par processus (la meme question sert a la reponse puis au « Voir plus »)."""
-    key = f"{corpus_version()}:{normalize(question)}"
+    key = f"{corpus_version()}:{normalize(question)}:{sorted(set(prefer or []))}"
     if key in _retrieval_cache:
         _retrieval_cache.move_to_end(key)
         return _retrieval_cache[key]
-    hits = await run_in_threadpool(retrieve, question, TOP_K)
+    hits = await run_in_threadpool(retrieve, question, TOP_K, prefer)
     _retrieval_cache[key] = hits
     while len(_retrieval_cache) > 2000:
         _retrieval_cache.popitem(last=False)
@@ -283,10 +315,44 @@ async def query(
         await enforce_rate_limit(request, x_client_id)
     except HTTPException:
         raise  # trop de requetes : non journalise comme une question
+    chat = small_talk_reply(question, req.language)
+    if chat:
+        analytics.log_event("chat", client_id=x_client_id, session_id=x_session_id, question=question, language=req.language)
+        return QueryResponse(
+            question=question, language=req.language, kind="chat", answered=False, answer=chat,
+            citations=[], sources_used=[], model="", usage=Usage(),
+        )
     try:
-        key = f"answer:v{corpus_version()}:{req.language}:{normalize(question)}"
-        data, cached = await store.cached(key, lambda: _answer(question, req.language))
-        response = QueryResponse(**{**data, "question": question})
+        history = [t.model_dump() for t in req.history if t.answer.strip()][-2:]
+        standalone = question
+        clause = format_only_clause(question) if history else None
+        periods = period_only(question) if history and not clause else None
+        if clause:
+            # Simple demande de mise en forme : meme sujet que la question precedente.
+            standalone = with_format(history[-1]["question"], clause)
+        elif periods:
+            # Simple relance de periode (« et pour 2025 ? ») : meme sujet, autre periode —
+            # meme si la question precedente n'a pas eu de reponse.
+            standalone = with_period(history[-1]["question"], periods)
+        elif history:
+            try:
+                standalone = await acondense(question, history)
+            except Exception:
+                logger.warning("reformulation impossible, question telle quelle", exc_info=True)
+        prefer = [(src["title"], src["page"]) for t in history[-1:] for src in t["sources"] if src["page"] is not None]
+        previous = history[-1]["answer"] if history else None
+        # La reponse precedente fait partie de la cle : « mets ca en tableau » apres deux
+        # reponses differentes ne doit pas resservir la meme reponse en cache.
+        prev_key = hashlib.sha1(previous.encode()).hexdigest()[:12] if previous else "-"
+        key = f"answer:v13:{corpus_version()}:{req.language}:{normalize(standalone)}:{sorted(set(prefer))}:{prev_key}"
+        data, cached = await store.cached(
+            key,
+            lambda: _answer(standalone, req.language, prefer, previous, temperature=0.6 if req.regenerate else 0.2),
+            refresh=req.regenerate,
+        )
+        response = QueryResponse(
+            **{**data, "question": question, "standalone_question": standalone if standalone != question else None}
+        )
         return response
     finally:
         analytics.log_event(
@@ -307,42 +373,97 @@ async def query(
         )
 
 
-async def _answer(question: str, language: str) -> dict:
+YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
+
+
+def filter_by_years(question: str, hits: list[dict]) -> list[dict]:
+    """Question qui cite une ou des annees : seuls les extraits qui les mentionnent
+    (texte ou titre du document) sont donnes au modele. Evite qu'il lise un chiffre
+    d'une autre annee dans un tableau (colonnes d'annees perdues a l'extraction du
+    PDF). Aucun extrait pour ces annees => liste vide => « pas de donnees »."""
+    years = set(YEAR_RE.findall(question))
+    if not years:
+        return hits
+    return [h for h in hits if any(y in h["text"] or y in h["source"] for y in years)]
+
+
+_EMPTY_ANSWER_RE = re.compile(
+    r"(n'est|ne sont|n'a|n'ont|ne figure|ne figurent|ne contient|ne contiennent)\s+(pas|aucun)"
+    r"[^.]{0,60}(indiqu|mentionn|pr[ée]cis|disponible|fourni|pr[ée]sent|donn)",
+    re.IGNORECASE,
+)
+
+
+def _is_empty_answer(answer: str, question: str) -> bool:
+    """Reponse du type « l'information n'est pas explicitement indiquee », sans
+    aucun chiffre propre : c'est une absence de donnees, affichee comme telle."""
+    return bool(_EMPTY_ANSWER_RE.search(answer)) and not [
+        f for f in _figures(answer) if f not in set(_figures(question))
+    ]
+
+
+def _fallback_sources(answer: str, hits: list[dict]) -> list[int]:
+    """Si le modele n'a pas indique ses sources : les extraits qui contiennent
+    les chiffres de la reponse, a defaut le plus pertinent."""
+    figures = _figures(answer)
+    matching = [
+        i for i, h in enumerate(hits)
+        if figures and any(f in _normalize_numbers(h["text"]) for f in figures)
+    ]
+    return matching[:3] or [0]
+
+
+async def _answer(
+    question: str,
+    language: str,
+    prefer: list[tuple[str, int]] | None = None,
+    previous: str | None = None,
+    temperature: float = 0.2,
+) -> dict:
+    no_data = QueryResponse(
+        question=question, language=language, answered=False, kind="no_data",
+        answer=NO_DATA_MESSAGES.get(language, NO_DATA_MESSAGES["fr"]),
+        citations=[], sources_used=[], model=OPENROUTER_MODEL, usage=Usage(),
+    ).model_dump()
+    # Sigle inconnu de tout le corpus (ex. « DR ») : rien a chercher, et surtout
+    # rien a laisser inventer au modele.
+    if await run_in_threadpool(unknown_acronyms, question):
+        return no_data
     try:
-        hits = await aretrieve(question)
+        hits = filter_by_years(question, await aretrieve(question, prefer))
     except Exception:
         logger.exception("retrieval failed")
         raise HTTPException(status_code=500, detail=GENERIC_ERROR_MESSAGE)
 
-    no_data = QueryResponse(
-        question=question, language=language, answered=False,
-        answer=NO_DATA_MESSAGES.get(language, NO_DATA_MESSAGES["fr"]),
-        citations=[], sources_used=[], model=OPENROUTER_MODEL, usage=Usage(),
-    ).model_dump()
     if not hits:
         return no_data
 
     try:
-        completion = await acall_llm(question, hits, language)
-        answer = completion["choices"][0]["message"]["content"].strip()
+        completion = await acall_llm(question, hits, language, previous, temperature)
+        raw = completion["choices"][0]["message"]["content"].strip()
     except Exception:
         logger.exception("LLM call failed")
         raise HTTPException(status_code=502, detail=GENERIC_ERROR_MESSAGE)
 
-    if NO_DATA_MARKER in answer.upper():
+    answer, used = split_used_sources(raw, len(hits))
+    if not answer or answer.strip(" .").upper() == NO_DATA_MARKER or _is_empty_answer(answer, question):
         return no_data
 
     verified = figures_found_in_context(answer, hits, question)
+    # Sources affichees : seulement les extraits reellement utilises pour repondre.
+    cited = [hits[i] for i in (used or _fallback_sources(answer, hits))]
+    cited = list({(h["source"], h["page"]): h for h in cited}.values())
     citations = [
         Citation(
             document_id=document_id(h["url"]) if h.get("url") else h["source"],
             document_title=h["source"],
+            url=h.get("url"),
             quote=h["text"][:400],
             page_start=h["page"],
             page_end=h["page"],
             verified=verified,
         )
-        for h in hits
+        for h in cited
     ]
     usage = completion.get("usage") or {}
     return QueryResponse(
@@ -360,6 +481,8 @@ async def _answer(question: str, language: str) -> dict:
 class ExplainRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
     answer: str = Field(min_length=1, max_length=8000)
+    # Sources de la reponse courte : l'explication s'appuie d'abord sur elles.
+    sources: list[SourceRef] = Field(default_factory=list, max_length=6)
     language: Literal["fr", "wo", "en", "ff", "srr", "dyo"] = "fr"
 
 
@@ -380,8 +503,10 @@ async def explain_answer(
     await enforce_rate_limit(request, x_client_id)
     ok = False
     try:
-        key = f"explain:v{corpus_version()}:{req.language}:{normalize(question)}"
-        data, _ = await store.cached(key, lambda: _explain(question, req.answer.strip(), req.language))
+        prefer = [(src.title, src.page) for src in req.sources if src.page is not None]
+        answer_key = hashlib.sha1(req.answer.strip().encode()).hexdigest()[:12]
+        key = f"explain:v6:{corpus_version()}:{req.language}:{normalize(question)}:{sorted(set(prefer))}:{answer_key}"
+        data, _ = await store.cached(key, lambda: _explain(question, req.answer.strip(), req.language, prefer))
         ok = True
         return ExplainResponse(**data)
     finally:
@@ -391,9 +516,9 @@ async def explain_answer(
         )
 
 
-async def _explain(question: str, answer: str, language: str) -> dict:
+async def _explain(question: str, answer: str, language: str, prefer: list[tuple[str, int]] | None = None) -> dict:
     try:
-        hits = await aretrieve(question)
+        hits = filter_by_years(question, await aretrieve(question, prefer)) or await aretrieve(question, prefer)
         if not hits:
             raise HTTPException(status_code=404, detail=NO_INDEX_MESSAGE)
         return {"details": await aexplain(question, answer, hits, language)}

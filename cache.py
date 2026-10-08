@@ -117,14 +117,18 @@ class Store:
     async def set_json(self, key: str, value, ttl: int = CACHE_TTL) -> None:
         await self._call("set", key, json.dumps(value, ensure_ascii=False), ttl)
 
-    async def cached(self, key: str, compute: Callable[[], Awaitable], ttl: int = CACHE_TTL, cache_if=None):
+    async def cached(
+        self, key: str, compute: Callable[[], Awaitable], ttl: int = CACHE_TTL, cache_if=None, refresh: bool = False
+    ):
         """Renvoie (valeur, depuis_le_cache). Les appels concurrents sur une meme
-        cle partagent un seul calcul (single-flight)."""
-        hit = await self.get_json(key)
-        if hit is not None:
-            return hit, True
-        if key in self._inflight:
-            return await asyncio.shield(self._inflight[key]), True
+        cle partagent un seul calcul (single-flight). `refresh` : recalcule sans
+        lire le cache (bouton « Relancer ») puis remplace la valeur en cache."""
+        if not refresh:
+            hit = await self.get_json(key)
+            if hit is not None:
+                return hit, True
+            if key in self._inflight:
+                return await asyncio.shield(self._inflight[key]), True
 
         future = asyncio.get_running_loop().create_future()
         self._inflight[key] = future
