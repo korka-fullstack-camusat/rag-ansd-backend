@@ -486,8 +486,17 @@ class ExplainRequest(BaseModel):
     language: Literal["fr", "wo", "en", "ff", "srr", "dyo"] = "fr"
 
 
+class DetailSource(BaseModel):
+    n: int
+    title: str
+    page: int | None = None
+    url: str | None = None
+
+
 class ExplainResponse(BaseModel):
+    # Texte avec des references [[n]] placees apres chaque passage, renvoyant a `sources`.
     details: str
+    sources: list[DetailSource] = Field(default_factory=list)
 
 
 @app.post("/api/explain", response_model=ExplainResponse)
@@ -505,7 +514,7 @@ async def explain_answer(
     try:
         prefer = [(src.title, src.page) for src in req.sources if src.page is not None]
         answer_key = hashlib.sha1(req.answer.strip().encode()).hexdigest()[:12]
-        key = f"explain:v6:{corpus_version()}:{req.language}:{normalize(question)}:{sorted(set(prefer))}:{answer_key}"
+        key = f"explain:v8:{corpus_version()}:{req.language}:{normalize(question)}:{sorted(set(prefer))}:{answer_key}"
         data, _ = await store.cached(key, lambda: _explain(question, req.answer.strip(), req.language, prefer))
         ok = True
         return ExplainResponse(**data)
@@ -521,7 +530,8 @@ async def _explain(question: str, answer: str, language: str, prefer: list[tuple
         hits = filter_by_years(question, await aretrieve(question, prefer)) or await aretrieve(question, prefer)
         if not hits:
             raise HTTPException(status_code=404, detail=NO_INDEX_MESSAGE)
-        return {"details": await aexplain(question, answer, hits, language)}
+        details, sources = await aexplain(question, answer, hits, language)
+        return {"details": details, "sources": sources}
     except HTTPException:
         raise
     except Exception:

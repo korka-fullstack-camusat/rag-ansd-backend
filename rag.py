@@ -67,9 +67,55 @@ EXPLAIN_PROMPT = (
     "une liste a puces (lignes commencant par \"- \") si c'est plus clair. Tu peux "
     "mettre en **gras** les chiffres cles. N'invente rien : si le contexte n'apporte "
     "rien de plus, dis-le en une phrase. Chaque chiffre garde exactement le sens qu'il a dans "
-    "l'extrait (un taux de reponse n'est pas une evolution). N'ecris pas de references aux "
-    "sources dans le texte."
+    "l'extrait (un taux de reponse n'est pas une evolution). A la fin de chaque phrase ou de "
+    "chaque point de liste (jamais apres chaque chiffre), indique entre crochets le numero du "
+    "ou des extraits sur lesquels il s'appuie, par exemple [2] ou [1][3] — ces numeros "
+    "deviennent des liens vers la page source. N'ecris pas le titre des documents ni les pages "
+    "dans le texte."
 )
+
+
+# Marqueurs de reference dans l'explication : [2], [1][3], [1, 3], [Source 2]…
+_REF_GROUP = re.compile(r"\[(?:Sources?\s*)?(\d+(?:\s*[,;]\s*\d+)*)\]", re.IGNORECASE)
+
+
+def link_references(text: str, hits: list[dict]) -> tuple[str, list[dict]]:
+    """Remplace les numeros d'extraits par des references canoniques [[n]] et
+    renvoie la liste des sources correspondantes (une par document + page,
+    numerotees dans l'ordre d'apparition). Les numeros inconnus sont retires."""
+    sources: list[dict] = []
+    index: dict[tuple, int] = {}
+
+    def ref_for(i: int) -> str:
+        if not 1 <= i <= len(hits):
+            return ""
+        h = hits[i - 1]
+        key = (h["source"], h["page"])
+        if key not in index:
+            sources.append({"n": len(sources) + 1, "title": h["source"], "page": h["page"], "url": h.get("url")})
+            index[key] = len(sources)
+        return f"[[{index[key]}]]"
+
+    def replace(match: re.Match) -> str:
+        refs = dict.fromkeys(ref_for(int(n)) for n in re.findall(r"\d+", match.group(1)))
+        return "".join(r for r in refs if r)
+
+    linked = _REF_GROUP.sub(replace, text)
+    linked = re.sub(r"\s+(\[\[\d+\]\])", r"\1", linked)  # colle la reference au texte
+    linked = "\n".join(_dedupe_refs(line) for line in linked.split("\n"))
+    return linked.strip(), sources
+
+
+def _dedupe_refs(line: str) -> str:
+    """Dans un paragraphe, une suite de passages citant la meme source n'affiche
+    qu'un lien, a la fin de cette suite : un nouveau lien n'apparait que quand
+    la source change."""
+    parts = re.split(r"(\[\[\d+\]\])", line)
+    ref_positions = [i for i, p in enumerate(parts) if re.fullmatch(r"\[\[\d+\]\]", p)]
+    for current, following in zip(ref_positions, ref_positions[1:]):
+        if parts[current] == parts[following]:
+            parts[current] = ""
+    return "".join(parts)
 
 _embedder = None
 _collection = None
@@ -579,9 +625,10 @@ def explain(question: str, answer: str, hits: list[dict], language: str = "fr") 
     return completion["choices"][0]["message"]["content"].strip()
 
 
-async def aexplain(question: str, answer: str, hits: list[dict], language: str = "fr") -> str:
-    completion = await _achat(_explain_messages(question, answer, hits, language), temperature=0.2, max_tokens=700)
-    return completion["choices"][0]["message"]["content"].strip()
+async def aexplain(question: str, answer: str, hits: list[dict], language: str = "fr") -> tuple[str, list[dict]]:
+    """Explication detaillee + sources citees dans le texte (marqueurs [[n]])."""
+    completion = await _achat(_explain_messages(question, answer, hits, language), temperature=0.2, max_tokens=800)
+    return link_references(completion["choices"][0]["message"]["content"].strip(), hits)
 
 
 TITLE_PROMPT = (
