@@ -37,6 +37,7 @@ from rag import (
     ashort_title,
     get_collection,
     corpus_index,
+    aguidance,
     corpus_reply,
     acondense,
     get_embedder,
@@ -44,6 +45,7 @@ from rag import (
     format_only_clause,
     period_only,
     with_period,
+    guidance_question,
     small_talk_reply,
     split_used_sources,
     with_format,
@@ -392,6 +394,22 @@ async def _query(
             question=question, language=req.language, kind="chat", answered=False, answer=about_corpus,
             citations=[], sources_used=[], model="", usage=Usage(),
         )
+    if guidance_question(question):
+        # Demande de conseil (« que me conseillez-vous pour recuperer les donnees ? ») :
+        # reponse de guide, sans recherche documentaire ni chiffre.
+        history = [t.model_dump() for t in req.history if t.answer.strip()][-1:]
+        try:
+            completion = await aguidance(question, req.language, history)
+            advice = completion["choices"][0]["message"]["content"].strip()
+        except Exception:
+            logger.exception("guidance failed")
+            advice = ""
+        if advice:
+            analytics.log_event("chat", client_id=x_client_id, session_id=x_session_id, question=question, language=req.language)
+            return QueryResponse(
+                question=question, language=req.language, kind="chat", answered=False, answer=advice,
+                citations=[], sources_used=[], model=completion.get("model", OPENROUTER_MODEL), usage=Usage(),
+            )
     try:
         history = [t.model_dump() for t in req.history if t.answer.strip()][-2:]
         standalone = question

@@ -484,6 +484,112 @@ def corpus_reply(question: str, language: str) -> str | None:
     return text
 
 
+# --- demandes de conseil / mode d'emploi (« que me conseillez-vous en tant que debutant
+# pour recuperer les donnees ? », « ou trouver les chiffres de l'emploi ? »). Ce ne sont
+# pas des demandes de chiffres : la recherche documentaire n'y trouve rien et la reponse
+# serait « pas de donnees ». Le modele repond alors en guide, a partir de la liste des
+# publications reellement indexees, sans jamais donner de chiffre.
+_GUIDE_Q = re.compile(
+    r"\b(conseill\w+|(un|des|quels?|quelques|vos|tes|tous|meilleurs?) conseils?|recommand\w*|astuces?|sugger\w*|advice|advise|recommend\w*|tips?|suggest\w*)\b"
+    r"|\b(debutants?|novices?|neophytes?|beginners?|newbies?|premiers? pas|par ou commencer|"
+    r"comment commencer|comment debuter|get(ting)? started|where (do i|to|should i) start)\b"
+    r"|\b(comment|ou|ou est ce que|how (do i|can i|to|should i)|where (can i|do i|to))\b.*"
+    r"\b(recuper\w*|acced\w*|acces|obten\w*|trouv\w*|telecharg\w*|utilis\w*|exploit\w*|lire|interpret\w*|"
+    r"analys\w*|citer|get|find|access|download|use|read|interpret|cite)\b.*"
+    r"\b(donnees?|statistiques?|chiffres?|publications?|rapports?|bulletins?|microdonnees?|bases?|"
+    r"indicateurs?|enquetes?|data|statistics|figures|reports?|surveys?|indicators?)\b"
+    r"|\b(methodologie|demarche|bonnes pratiques|methodology|best practices?)\b"
+)
+# Une vraie demande de chiffre (« quel est le taux… », « combien… ») reste une question
+# sur les donnees, meme si elle contient « conseil » (ex. « Conseil economique… »).
+_FIGURE_Q = re.compile(r"^(quel(le)?s? (est|sont|etait|a ete)|combien|what (is|was|are)|how (much|many))\b")
+
+
+def guidance_question(question: str) -> bool:
+    text = _norm(question)
+    if not text or len(text.split()) > 40 or _FIGURE_Q.search(text):
+        return False
+    return bool(_GUIDE_Q.search(text))
+
+
+def publication_series(limit: int = 40) -> list[str]:
+    """Grandes series de publications du corpus (titres sans date ni periode)."""
+    counts: dict[str, int] = {}
+    labels: dict[str, str] = {}
+    for title in corpus_index()["titles"]:
+        name = re.sub(r"\s*\(?\b(?:19|20)\d{2}\b.*$", "", title).strip(" -_,(")
+        name = re.sub(r"\s+(janvier|fevrier|février|mars|avril|mai|juin|juillet|aout|août|septembre|"
+                      r"octobre|novembre|decembre|décembre|T[1-4])$", "", name, flags=re.IGNORECASE)
+        name = re.split(r"[,(_]", name)[0].strip(" -")
+        if len(name) >= 4:
+            key = _norm(name)
+            counts[key] = counts.get(key, 0) + 1
+            labels.setdefault(key, name)
+    return [labels[k] for k, _ in sorted(counts.items(), key=lambda kv: -kv[1])[:limit]]
+
+
+GUIDE_PROMPT = (
+    "Tu es l'assistant de l'ANSD (Agence Nationale de la Statistique et de la Demographie du "
+    "Senegal). L'utilisateur ne demande pas un chiffre mais un conseil : comment trouver, "
+    "recuperer, lire ou utiliser les statistiques de l'ANSD. Donne des conseils concrets, "
+    "bienveillants et adaptes a son niveau. "
+    "REGLES : ne donne AUCUN chiffre statistique (ni valeur, ni taux, ni effectif) ; n'invente "
+    "aucun nom de publication, aucune adresse web et aucune procedure : le seul site que tu peux "
+    "citer est www.ansd.sn (rubrique des publications). Pour nommer des publications, utilise "
+    "uniquement les listes fournies, en priorite les publications proches de la demande ; "
+    "ne suppose jamais ce que contient une publication au-dela de ce qu'indique son titre. "
+    "Pistes utiles (a choisir selon la question) : partir d'une question precise (indicateur, "
+    "zone, periode) ; commencer par les publications de synthese (Reperes statistiques, Bulletin "
+    "mensuel des statistiques economiques et financieres, chapitres de la Situation economique et "
+    "sociale - SES) avant les rapports detailles d'enquete ou de recensement ; lire les notes "
+    "methodologiques et les definitions ; verifier l'unite, la periode, le champ et l'annee de "
+    "base des indices ; preferer la publication la plus recente et noter les chiffres provisoires "
+    "ou revises ; toujours citer le document et la page ; pour des fichiers de microdonnees "
+    "d'enquete, se renseigner aupres de l'ANSD sur les conditions d'acces. "
+    "Rappelle enfin qu'il peut poser ici des questions chiffrees, l'assistant repondant a partir "
+    "des publications officielles avec le document et la page, et termine TOUJOURS par 2 exemples "
+    "de questions chiffrees en rapport avec sa demande, sur une ligne commencant par « Par exemple : » "
+    "(ex. « Quel était le taux de chômage au 2e trimestre 2024 ? »), sans y repondre. "
+    "FORMAT : court et lisible (une phrase d'introduction puis 4 a 6 points avec « - », 150 mots "
+    "environ au plus), sans titre Markdown."
+)
+
+
+def _guide_messages(question: str, language: str, history: list[dict] | None = None) -> list[dict]:
+    series = "\n".join(f"- {name}" for name in publication_series())
+    # Publications dont le contenu est le plus proche de la demande (ex. emploi → SES Emploi).
+    try:
+        near = list(dict.fromkeys(h["source"] for h in retrieve(question, top_k=12)))[:6]
+    except Exception:
+        near = []
+    nearby = "".join(f"- {title}\n" for title in near)
+    context = ""
+    if history:
+        last = history[-1]
+        context = f"Echange precedent - question : {last['question']}\nreponse : {last['answer'][:600]}\n\n"
+    return [
+        {"role": "system", "content": GUIDE_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"Series de publications de l'ANSD disponibles dans la base :\n{series}\n\n"
+                + (f"Publications de la base les plus proches de la demande :\n{nearby}\n" if nearby else "")
+                + f"{context}Demande : {question}\n\n"
+                f"Reponds en {LANGUAGE_NAMES.get(language, 'francais')}. Derniere ligne : « Par exemple : » "
+                "suivi de 2 questions demandant un CHIFFRE precis (commencant par « Quel », « Quelle » "
+                "ou « Combien », avec un indicateur et une periode), sans y repondre."
+            ),
+        },
+    ]
+
+
+async def aguidance(question: str, language: str = "fr", history: list[dict] | None = None) -> dict:
+    """Conseils d'utilisation des statistiques de l'ANSD (pas de recherche documentaire)."""
+    return await _achat(
+        await asyncio.to_thread(_guide_messages, question, language, history), temperature=0.3, max_tokens=450
+    )
+
+
 # --- demandes de mise en forme seules (« point par point », « en tableau »…)
 # Reconnues par regle, sans le modele : le sujet est celui de la question precedente.
 # (consigne, mots qui la declenchent — sans accents, debut de mot)
