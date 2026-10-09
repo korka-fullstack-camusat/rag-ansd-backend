@@ -6,3 +6,4 @@ __pycache__/
 storage/
 data/
 .DS_Store
+fastindex/

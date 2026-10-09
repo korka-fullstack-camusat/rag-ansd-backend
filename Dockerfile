@@ -3,7 +3,9 @@ FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     # Cache du modele d'embedding fastembed (monte en volume par docker-compose)
-    FASTEMBED_CACHE_PATH=/models
+    FASTEMBED_CACHE_PATH=/models \
+    # Index de recherche rapide (monte en volume par docker-compose)
+    FASTINDEX_DIR=/app/fastindex
 
 WORKDIR /app
 
@@ -13,7 +15,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY *.py ./
 
 # data/ (manifest.csv) et storage/ (base Chroma) sont montes en volumes
-RUN mkdir -p data storage /models
+RUN mkdir -p data storage /models /app/fastindex
 
 EXPOSE 8000
 

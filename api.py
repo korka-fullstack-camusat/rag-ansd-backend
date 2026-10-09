@@ -19,13 +19,17 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from typing import Literal
 
+import json
+
+import agent
 import analytics
+import fastindex
 from cache import normalize, store
 import voice
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse, Response
+from fastapi.responses import RedirectResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from config import MANIFEST_PATH, TOP_K
@@ -88,6 +92,9 @@ async def lifespan(_app: FastAPI):
     # demarrage, pas a la premiere question d'un utilisateur.
     await run_in_threadpool(lambda: list(get_embedder().embed(["warmup"])))
     await run_in_threadpool(get_collection)
+    # Index de recherche rapide (fastindex.py) : charge en ~1 s, ou construit depuis Chroma (~3 min)
+    # au premier demarrage. En arriere-plan : en attendant, la recherche passe par Chroma.
+    threading.Thread(target=fastindex.ensure, daemon=True).start()
     # Index du corpus (titres, URL, sigles) : environ 2 minutes la premiere fois,
     # puis lu depuis storage/corpus_cache.json. Lance en arriere-plan pour ne pas
     # retarder le demarrage ; les requetes qui en dependent attendent la fin.
@@ -344,7 +351,7 @@ async def query(
     (meme recherche, meme cache), puis la reponse est traduite en wolof."""
     if req.language != "wo":
         return await _query(req, request, x_client_id, x_session_id)
-    chat = small_talk_reply(req.question, "wo")  # « Nanga def ? », « Jërëjëf »… sont reconnus tels quels
+    chat = None if agent.AGENT_ENABLED else small_talk_reply(req.question, "wo")  # l'agent converse lui-meme
     if chat:
         await enforce_rate_limit(request, x_client_id)
         analytics.log_event("chat", client_id=x_client_id, session_id=x_session_id, question=req.question, language="wo")
@@ -371,11 +378,150 @@ async def query(
     return resp.model_copy(update={"language": "wo", "question": req.question, "answer": answer})
 
 
+def _agent_cache_key(req: QueryRequest, question: str) -> str | None:
+    """Cle de cache d'une reponse de l'agent. Seules les questions qui ouvrent une discussion sont
+    mises en cache : une question de suite depend de ce qui precede. « Relancer » ignore le cache."""
+    if req.regenerate or any(t.answer.strip() for t in req.history):
+        return None
+    return f"agent:{agent.AGENT_VERSION}:{corpus_version()}:{agent.MISTRAL_MODEL}:{req.language}:{normalize(question)}"
+
+
+def _agent_response(
+    result: dict, req: QueryRequest, question: str, started: float, x_client_id: str | None,
+    x_session_id: str | None, cached: bool = False,
+) -> QueryResponse:
+    """Resultat de l'agent -> reponse de l'API, et journal d'utilisation (tableau de bord admin)."""
+    citations = [
+        Citation(document_id=document_id(c["url"]) if c.get("url") else c["document_title"], **c)
+        for c in result["citations"]
+    ]
+    answered = bool(citations)
+    usage = result["usage"]
+    analytics.log_event(
+        "query" if result["searched"] else "chat",
+        client_id=x_client_id,
+        session_id=x_session_id,
+        question=question,
+        language=req.language,
+        mode=req.mode,
+        answered=answered if result["searched"] else None,
+        cached=cached,
+        latency_ms=round((time.perf_counter() - started) * 1000),
+        # Une reponse servie depuis le cache n'a rien consomme.
+        prompt_tokens=0 if cached else usage["prompt_tokens"],
+        completion_tokens=0 if cached else usage["completion_tokens"],
+        sources=list(dict.fromkeys(c.document_title for c in citations)),
+    )
+    return QueryResponse(
+        question=question,
+        kind="answer" if answered else "chat",
+        language=req.language,
+        answered=answered,
+        answer=result["answer"],
+        citations=citations,
+        sources_used=list(dict.fromkeys(c.document_id for c in citations)),
+        model=result["model"],
+        usage=Usage(**usage),
+    )
+
+
+async def _agent_query(
+    req: QueryRequest, question: str, x_client_id: str | None, x_session_id: str | None
+) -> QueryResponse | None:
+    """Reponse de l'agent conversationnel (voir agent.py), depuis le cache si possible. None si l'agent echoue."""
+    started = time.perf_counter()
+    key = _agent_cache_key(req, question)
+    if key and (hit := await store.get_json(key)):
+        return _agent_response(hit, req, question, started, x_client_id, x_session_id, cached=True)
+    history = [t.model_dump() for t in req.history if t.answer.strip()]
+    try:
+        result = await agent.run_agent(question, req.language, history, temperature=0.7 if req.regenerate else 0.2)
+    except Exception:
+        logger.exception("agent failed")
+        return None
+    if key:
+        await store.set_json(key, result)
+    return _agent_response(result, req, question, started, x_client_id, x_session_id)
+
+
+def _ndjson(event: dict) -> bytes:
+    return (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+@app.post("/api/query/stream")
+async def query_stream(
+    req: QueryRequest,
+    request: Request,
+    x_client_id: str | None = Header(default=None),
+    x_session_id: str | None = Header(default=None),
+) -> StreamingResponse:
+    """Meme reponse que /api/query, mais envoyee au fil de l'eau (une ligne JSON par evenement) :
+      {"type": "status", "text": "search"}   recherche en cours ;
+      {"type": "delta", "text": "…"}         morceau de texte (marqueurs [n] a masquer a l'affichage) ;
+      {"type": "reset"}                      oublier le texte recu (nouvelle recherche ou correction) ;
+      {"type": "done", "response": {...}}    reponse finale (QueryResponse), qui remplace le texte recu ;
+      {"type": "error", "detail": "…"}.
+    Wolof : la reponse doit etre traduite en entier, elle arrive donc en une fois (« done »)."""
+    question = req.question.strip()
+    if req.language == "wo" or not agent.AGENT_ENABLED:
+        response = await query(req, request, x_client_id, x_session_id)
+
+        async def single():
+            yield _ndjson({"type": "done", "response": response.model_dump()})
+
+        return StreamingResponse(single(), media_type="application/x-ndjson")
+
+    await enforce_rate_limit(request, x_client_id)  # avant d'ouvrir le flux : une erreur 429 normale
+    started = time.perf_counter()
+    key = _agent_cache_key(req, question)
+    hit = await store.get_json(key) if key else None
+
+    async def events():
+        if hit:
+            response = _agent_response(hit, req, question, started, x_client_id, x_session_id, cached=True)
+            yield _ndjson({"type": "done", "response": response.model_dump()})
+            return
+        history = [t.model_dump() for t in req.history if t.answer.strip()]
+        sent_text = False
+        try:
+            async for event in agent.agent_events(
+                question, req.language, history, temperature=0.7 if req.regenerate else 0.2
+            ):
+                if event["type"] == "result":
+                    result = event["data"]
+                    if key:
+                        await store.set_json(key, result)
+                    response = _agent_response(result, req, question, started, x_client_id, x_session_id)
+                    yield _ndjson({"type": "done", "response": response.model_dump()})
+                    return
+                sent_text = sent_text or event["type"] == "delta"
+                yield _ndjson(event)
+        except Exception:
+            logger.exception("agent failed (flux)")
+        # Agent indisponible : ancien circuit a regles, pour toujours repondre.
+        try:
+            if sent_text:
+                yield _ndjson({"type": "reset"})
+            response = await _query(req, request, x_client_id, x_session_id, skip_agent=True)
+            yield _ndjson({"type": "done", "response": response.model_dump()})
+        except HTTPException as exc:
+            yield _ndjson({"type": "error", "detail": exc.detail})
+        except Exception:
+            logger.exception("repli apres echec de l'agent impossible")
+            yield _ndjson({"type": "error", "detail": GENERIC_ERROR_MESSAGE})
+
+    # X-Accel-Buffering : un proxy (nginx) ne doit pas retenir le flux.
+    return StreamingResponse(
+        events(), media_type="application/x-ndjson", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    )
+
+
 async def _query(
     req: QueryRequest,
     request: Request,
     x_client_id: str | None,
     x_session_id: str | None,
+    skip_agent: bool = False,
 ) -> QueryResponse:
     """Repond a la question (depuis le cache si elle a deja ete posee) et
     journalise l'utilisation (tableau de bord admin)."""
@@ -383,10 +529,13 @@ async def _query(
     question = req.question.strip()
     response: QueryResponse | None = None
     cached = False
-    try:
-        await enforce_rate_limit(request, x_client_id)
-    except HTTPException:
-        raise  # trop de requetes : non journalise comme une question
+    if not skip_agent:  # repli du flux : limite deja appliquee
+        await enforce_rate_limit(request, x_client_id)  # trop de requetes : non journalise comme une question
+    if agent.AGENT_ENABLED and not skip_agent:
+        agent_response = await _agent_query(req, question, x_client_id, x_session_id)
+        if agent_response is not None:
+            return agent_response
+        # Agent indisponible (erreur du modele…) : ancien circuit a regles, pour toujours repondre.
     chat = small_talk_reply(question, req.language)
     if chat:
         analytics.log_event("chat", client_id=x_client_id, session_id=x_session_id, question=question, language=req.language)

@@ -246,17 +246,68 @@ async def translate(text: str, source: str, target: str, timeout: float = TRANSL
     return out
 
 
+def _acceptable(source_fr: str, out: str) -> bool:
+    """Traduction utilisable : differente de la source, chiffres conserves, peu de mots francais."""
+    return out.strip() != source_fr.strip() and numbers_preserved(source_fr, out) and _french_ratio(out) <= 0.2
+
+
+# Soynade ne traduit pas le vocabulaire statistique (« taux », « population »… reviennent tels quels)
+# et limite le debit (429) : un modele de langage prend alors le relais. Gemini Flash donne le wolof
+# le plus fidele des modeles essayes (gpt-4.1 et claude contresens sur « jëfandikoo »).
+WOLOF_LLM_MODEL = os.environ.get("WOLOF_LLM_MODEL", "google/gemini-2.5-flash")
+WOLOF_LLM_TIMEOUT = 40
+_WOLOF_SYSTEM = (
+    "Tu es un traducteur professionnel francais -> wolof (orthographe officielle du CLAD, alphabet latin : "
+    "ñ, ŋ, ë, à, é, ó, x, c, j). Traduis fidelement, en wolof naturel et simple, tel qu'on le parle au Senegal. "
+    "Garde EXACTEMENT tels quels tous les chiffres et nombres, les annees, les pourcentages, les noms propres, "
+    "les sigles (ANSD, RGPH-5…) et les titres de documents. Reponds uniquement par la traduction, sans commentaire."
+)
+
+
+async def _llm_translate_to_wolof(text_fr: str) -> str | None:
+    api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if not api_key:
+        return None
+    try:
+        resp = await _http().post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "model": WOLOF_LLM_MODEL,
+                "temperature": 0.2,
+                "max_tokens": 1500,
+                "messages": [{"role": "system", "content": _WOLOF_SYSTEM}, {"role": "user", "content": text_fr}],
+            },
+            timeout=WOLOF_LLM_TIMEOUT,
+        )
+        resp.raise_for_status()
+        out = resp.json()["choices"][0]["message"]["content"]
+    except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError):
+        logger.warning("traduction wolof par LLM impossible", exc_info=True)
+        return None
+    return out.strip() if isinstance(out, str) and out.strip() else None
+
+
 async def to_wolof(text_fr: str) -> str:
-    """Traduction francais -> wolof d'une reponse ; le francais d'origine si la traduction
-    echoue, est identique au texte source, ou ne conserve pas les chiffres."""
+    """Traduction francais -> wolof d'une reponse : Soynade d'abord, puis un modele de langage s'il
+    echoue ou renvoie du francais. Le francais d'origine si aucune traduction ne conserve les chiffres."""
     try:
         out = await translate(text_fr, "fr", "wo", timeout=20)
+        if _acceptable(text_fr, out):
+            return out
     except VoiceError:
-        return text_fr
-    # Refuse : traduction identique, chiffres alteres, ou melange wolof-francais (trop de mots francais).
-    if out.strip() == text_fr.strip() or not numbers_preserved(text_fr, out) or _french_ratio(out) > 0.2:
-        return text_fr
-    return out
+        pass
+    key = ("fr", "wo-llm", text_fr)
+    if key in _tr_cache:
+        _tr_cache.move_to_end(key)
+        return _tr_cache[key]
+    out = await _llm_translate_to_wolof(text_fr)
+    if out and _acceptable(text_fr, out):
+        _tr_cache[key] = out
+        while len(_tr_cache) > _CACHE_MAX:
+            _tr_cache.popitem(last=False)
+        return out
+    return text_fr
 
 
 # Detection grossiere du wolof : le service de traduction retourne le sens inverse (francais ->

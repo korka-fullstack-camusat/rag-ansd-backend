@@ -20,6 +20,8 @@ services:
       - ./data:/app/data
       - ./storage:/app/storage
       - fastembed-models:/models
+      # Index de recherche rapide (fastindex.py), construit au premier demarrage (~3 min)
+      - fastindex-data:/app/fastindex
     depends_on:
       - redis
     healthcheck:
@@ -40,3 +42,5 @@ services:
 volumes:
   fastembed-models:
     name: ansd-fastembed-models
+  fastindex-data:
+    name: ansd-fastindex
