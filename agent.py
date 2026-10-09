@@ -38,7 +38,7 @@ from fastindex import doc_year, has_value, keywords, period_label, pub_date
 logger = logging.getLogger("ansd-agent")
 
 AGENT_ENABLED = os.environ.get("AGENT_ENABLED", "1").strip().lower() not in {"0", "false", "no", ""}
-AGENT_VERSION = "v5"  # dans la cle de cache des reponses : a changer quand le comportement de l'agent change
+AGENT_VERSION = "v8"  # dans la cle de cache des reponses : a changer quand le comportement de l'agent change
 # Fournisseur principal : Mistral (API directe). OpenRouter sert de secours (modele AGENT_MODEL).
 MISTRAL_BASE_URL = os.environ.get("MISTRAL_BASE_URL", "https://api.mistral.ai/v1").rstrip("/")
 # Version datee (et non « -latest ») : le comportement ne change pas a l'insu du projet.
@@ -246,6 +246,8 @@ la conversation précédente ou les passages sont dans une autre langue (l'utili
 de discussion : la langue choisie l'emporte toujours). Ton direct et bienveillant ; vouvoie sauf si la personne te tutoie.
 - Court par défaut (2 à 5 phrases) : l'essentiel d'abord (valeur, unité, période), puis un éclairage utile si les \
 passages le donnent. Plus long seulement si on te le demande. Respecte le format demandé (liste, tableau Markdown…).
+- Mise en forme autorisée : paragraphes, **gras**, listes (« - » ou « 1. ») et tableaux Markdown. Jamais de ligne de \
+séparation (« --- », « *** »), de titre (« # »), d'italique, de citation (« > »), de code ni de lien Markdown.
 - Pas de « selon les extraits » ni de vocabulaire technique (passage, recherche automatique, outil).
 - Une question de suite (« et pour les jeunes ? », « en tableau ») se rattache à la conversation.
 - Hors sujet ou information absente de la base (une personne, l'actualité, un autre pays…) : en une ou deux phrases, \
@@ -550,6 +552,29 @@ _REF_RE = re.compile(r"\s*\[(?:Sources?\s*)?(\d+(?:\s*[,;]\s*\d+)*)\]", re.IGNOR
 _SOURCES_LINE_RE = re.compile(r"\n?[ \t]*\**SOURCES?\**\s*:.*$", re.IGNORECASE | re.DOTALL)
 
 
+_RULE_LINE_RE = re.compile(r"^\s*([-*_])(\s*\1){2,}\s*$")
+
+
+def clean_markdown(text: str) -> str:
+    """Retire la syntaxe Markdown que l'interface n'affiche pas (lignes « --- », titres « # », citations
+    « > », code, liens, italiques) ; garde le gras, les listes et les tableaux."""
+    lines = []
+    for line in text.split("\n"):
+        if _RULE_LINE_RE.match(line) and "|" not in line:  # « |---|---| » est un tableau, pas une separation
+            lines.append("")
+            continue
+        # Titre -> ligne en gras (sans doubler le gras d'un titre deja en gras : « ### **1. …** »).
+        line = re.sub(r"^\s*#{1,6}\s+(.*)$", lambda m: f"**{m.group(1).replace('**', '').strip()}**", line)
+        line = re.sub(r"\*{3,}", "**", line)
+        line = re.sub(r"^\s*>\s?", "", line)
+        line = re.sub(r"\[([^\]]+)\]\((?:https?://|/)[^)]*\)", r"\1", line)
+        line = line.replace("`", "")
+        line = re.sub(r"(?<![*\w])\*(?!\*)([^*\n]+?)(?<![\s*])\*(?![*\w])", r"\1", line)  # *italique*
+        line = re.sub(r"(?<![_\w])_(?!_)([^_\n]+?)(?<!\s)_(?![_\w])", r"\1", line)  # _italique_
+        lines.append(line.rstrip())
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
 def _snippet(text: str, figs: list[str]) -> str:
     """Extrait lisible du passage : autour du chiffre cite si on le retrouve, sinon le debut."""
     flat = " ".join(text.split())
@@ -574,6 +599,7 @@ def finalize(raw: str, run: _Run, question: str) -> dict:
 
     text = _REF_RE.sub(strip, raw)
     text = _SOURCES_LINE_RE.sub("", text)
+    text = clean_markdown(text)
     text = re.sub(r"[ \t]+([,.;:!?])", r"\1", text).strip()
 
     asked = figures.figure_set(question)
@@ -721,7 +747,7 @@ async def agent_events(
                 "content": (
                     f"(Rappel système : la langue choisie dans l'interface est le {language_name}. Réécris toute ta "
                     f"réponse en {language_name}, avec les mêmes chiffres et les mêmes références [n], sans mentionner "
-                    "ce rappel.)"
+                    "ce rappel ni une correction.)"
                 ),
             })
             continue
@@ -736,8 +762,8 @@ async def agent_events(
                 "content": (
                     f"(Rappel système : {', '.join(misattributed[:6])} ne figure pas dans les passages que tu cites. "
                     "Vérifie la période et la source de chaque chiffre : cite le passage exact qui le contient, ou "
-                    "retire le chiffre s'il concerne une autre période. Réponds directement à l'utilisateur, sans "
-                    "jamais mentionner ce rappel ni t'excuser.)"
+                    "retire le chiffre s'il concerne une autre période. "
+                    "Réécris ta réponse COMPLÈTE à la question de l'utilisateur (pas seulement la partie concernée), comme une première réponse : ne mentionne jamais ce rappel, une correction, une « version corrigée » ni d'excuses.)"
                 ),
             })
             continue
@@ -751,8 +777,8 @@ async def agent_events(
                 "content": (
                     f"(Rappel système : les chiffres {', '.join(unsupported[:6])} ne figurent dans aucun passage obtenu. "
                     "Cherche-les avec search_publications, ou retire-les ; n'écris que des chiffres présents dans les "
-                    "passages, recopiés tels quels, sans arrondi ni conversion. Réponds directement à l'utilisateur, "
-                    "sans jamais mentionner ce rappel ni t'excuser.)"
+                    "passages, recopiés tels quels, sans arrondi ni conversion. "
+                    "Réécris ta réponse COMPLÈTE à la question de l'utilisateur (pas seulement la partie concernée), comme une première réponse : ne mentionne jamais ce rappel, une correction, une « version corrigée » ni d'excuses.)"
                 ),
             })
             continue

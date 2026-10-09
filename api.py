@@ -817,7 +817,7 @@ async def _explain(question: str, answer: str, language: str, prefer: list[tuple
         if not hits:
             raise HTTPException(status_code=404, detail=NO_INDEX_MESSAGE)
         details, sources = await aexplain(question, answer, hits, language)
-        return {"details": details, "sources": sources}
+        return {"details": agent.clean_markdown(details), "sources": sources}
     except HTTPException:
         raise
     except Exception:
