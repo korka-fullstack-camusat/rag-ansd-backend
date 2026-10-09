@@ -6,6 +6,8 @@
 #
 # L'API reste sur http://localhost:8000 : le frontend n'a rien a changer.
 # Ne pas lancer en meme temps que docker-compose.yml (meme port 8000).
+name: ansd-backend-scale
+
 services:
   api:
     image: nginx:1.27-alpine
@@ -32,6 +34,9 @@ services:
       RATE_LIMIT_IP_PER_MINUTE: ${RATE_LIMIT_IP_PER_MINUTE:-600}
       # Seul Nginx joint les instances : on peut lui faire confiance pour l'IP client.
       FORWARDED_ALLOW_IPS: "*"
+      # Modeles locaux (service local-models ci-dessous) : voix wolof de secours, traduction pulaar
+      LOCAL_TTS_URL: http://local-models:8001
+      LOCAL_MT_URL: http://local-models:8001
     deploy:
       replicas: 3
     volumes:
@@ -55,8 +60,23 @@ services:
     command: ["redis-server", "--maxmemory", "1gb", "--maxmemory-policy", "allkeys-lru", "--save", ""]
     restart: unless-stopped
 
+  # Modeles locaux (voix wolof, traduction pulaar), partages par les instances du backend.
+  local-models:
+    build: ./local_models
+    environment:
+      TTS_WORKERS: ${TTS_WORKERS:-6}
+      TTS_THREADS: ${TTS_THREADS:-3}
+      TTS_SPEED: ${TTS_SPEED:-1.25}
+      TTS_STRETCH: ${TTS_STRETCH:-rubberband}
+      TTS_DENOISE: ${TTS_DENOISE:-0}
+    volumes:
+      - local-models-cache:/models
+    restart: unless-stopped
+
 volumes:
   fastembed-models:
     name: ansd-fastembed-models
   fastindex-data:
     name: ansd-fastindex
+  local-models-cache:
+    name: ansd-tts-models

@@ -7,6 +7,7 @@ Les formes de reponse suivent exactement les types TypeScript du frontend
 """
 
 import asyncio
+import base64
 import csv
 import hashlib
 import logging
@@ -178,6 +179,8 @@ class QueryResponse(BaseModel):
     usage: Usage
     # Reponses « guide » : publications recommandees, referencees [[n]] dans le texte.
     sources: list[DetailSource] = Field(default_factory=list)
+    # Langues traduites automatiquement (wolof, pulaar) : la reponse francaise d'origine.
+    original_answer: str | None = None
 
 
 class SourceDocument(BaseModel):
@@ -339,6 +342,10 @@ async def _to_french(text: str, timeout: float = 25) -> str:
         return text
 
 
+# Langues traitees en francais puis traduites (question a l'aller, reponse au retour).
+TRANSLATED_LANGUAGES = {"wo", "ff"}
+
+
 @app.post("/api/query", response_model=QueryResponse)
 async def query(
     req: QueryRequest,
@@ -346,12 +353,13 @@ async def query(
     x_client_id: str | None = Header(default=None),
     x_session_id: str | None = Header(default=None),
 ) -> QueryResponse:
-    """Point d'entree. Anglais et francais : traites directement. Wolof : la question et
-    l'historique sont traduits en francais (Soynade), traites comme une question francaise
-    (meme recherche, meme cache), puis la reponse est traduite en wolof."""
-    if req.language != "wo":
+    """Point d'entree. Anglais et francais : traites directement. Wolof et pulaar : la question et
+    l'historique sont traduits en francais (wolof : Soynade ; pulaar : modele local), traites comme
+    une question francaise (meme recherche, meme cache), puis la reponse est traduite."""
+    if req.language not in TRANSLATED_LANGUAGES:
         return await _query(req, request, x_client_id, x_session_id)
-    chat = None if agent.AGENT_ENABLED else small_talk_reply(req.question, "wo")  # l'agent converse lui-meme
+    lang = req.language
+    chat = None if agent.AGENT_ENABLED or lang != "wo" else small_talk_reply(req.question, "wo")
     if chat:
         await enforce_rate_limit(request, x_client_id)
         analytics.log_event("chat", client_id=x_client_id, session_id=x_session_id, question=req.question, language="wo")
@@ -362,10 +370,11 @@ async def query(
             question=req.question, language="wo", kind="chat", answered=False, answer=chat,
             citations=[], sources_used=[], model="", usage=Usage(),
         )
+    to_fr = (lambda text, timeout=25: _to_french(text, timeout)) if lang == "wo" else (lambda text, timeout=25: voice.pulaar_to_french(text))
     question_fr, *history_fr = await asyncio.gather(
-        _to_french(req.question),
-        *[_to_french(t.answer, timeout=10) for t in req.history[-2:]],
-        *[_to_french(t.question, timeout=10) for t in req.history[-2:]],
+        to_fr(req.question),
+        *[to_fr(t.answer, timeout=10) for t in req.history[-2:]],
+        *[to_fr(t.question, timeout=10) for t in req.history[-2:]],
     )
     turns = req.history[-2:]
     history = [
@@ -374,8 +383,13 @@ async def query(
     ]
     fr_req = req.model_copy(update={"language": "fr", "question": question_fr, "history": history})
     resp = await _query(fr_req, request, x_client_id, x_session_id)
-    answer = await voice.to_wolof(resp.answer) if resp.answer else resp.answer
-    return resp.model_copy(update={"language": "wo", "question": req.question, "answer": answer})
+    translate = voice.to_wolof if lang == "wo" else voice.to_pulaar
+    answer = await translate(resp.answer) if resp.answer else resp.answer
+    return resp.model_copy(update={
+        "language": lang, "question": req.question, "answer": answer,
+        # Texte francais d'origine, affiche a la demande : la traduction automatique peut se tromper.
+        "original_answer": resp.answer if answer != resp.answer else None,
+    })
 
 
 def _agent_cache_key(req: QueryRequest, question: str) -> str | None:
@@ -463,7 +477,7 @@ async def query_stream(
       {"type": "error", "detail": "…"}.
     Wolof : la reponse doit etre traduite en entier, elle arrive donc en une fois (« done »)."""
     question = req.question.strip()
-    if req.language == "wo" or not agent.AGENT_ENABLED:
+    if req.language in TRANSLATED_LANGUAGES or not agent.AGENT_ENABLED:
         response = await query(req, request, x_client_id, x_session_id)
 
         async def single():
@@ -813,6 +827,8 @@ async def _explain(question: str, answer: str, language: str, prefer: list[tuple
 
 class TitleRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
+    # Langue de l'interface : le titre affiche dans l'historique est traduit dans cette langue.
+    language: Literal["fr", "wo", "en", "ff", "srr", "dyo"] = "fr"
 
 
 class TitleResponse(BaseModel):
@@ -834,8 +850,20 @@ async def title(req: TitleRequest, request: Request, x_session_id: str | None = 
     except Exception:
         logger.exception("title generation failed")
         raise HTTPException(status_code=502, detail=GENERIC_ERROR_MESSAGE)
+    # Le tableau de bord regroupe les sujets en francais ; l'historique affiche le titre traduit.
     await run_in_threadpool(analytics.log_session_title, x_session_id, data["title"])
+    if req.language in ("en", "wo", "ff"):
+        translated, _ = await store.cached(
+            f"title:{req.language}:{normalize(question)}",
+            lambda: _translated_title(data["title"], req.language),
+            ttl=7 * 24 * 3600,
+        )
+        return TitleResponse(**translated)
     return TitleResponse(**data)
+
+
+async def _translated_title(title_fr: str, language: str) -> dict:
+    return {"title": await voice.translate_title(title_fr, language)}
 
 
 async def _title(question: str) -> dict:
@@ -933,8 +961,16 @@ async def voice_speak(
     """Lecture a voix haute d'une reponse (Soynade, voir voice.py). 501 pour les langues
     sans voix : le frontend retombe alors sur la synthese du navigateur."""
     await enforce_rate_limit(request, x_client_id)
+    # Meme texte, meme audio : chaque reponse n'est synthetisee qu'une fois (quota Soynade limite).
+    key = f"tts:v3:{req.language}:{hashlib.sha1(req.text.encode('utf-8')).hexdigest()}"
+    cached = await store.get_json(key)
+    if cached:
+        return Response(content=base64.b64decode(cached["audio"]), media_type=cached["type"])
     try:
-        content, media_type = await voice.synthesize(req.text, req.language)
+        content, media_type, provider = await voice.synthesize(req.text, req.language)
     except voice.VoiceError as exc:
         raise HTTPException(status_code=exc.status, detail=exc.detail)
+    # Voix locale (secours) gardee peu de temps : la voix Soynade reprend des que son quota revient.
+    ttl = 7 * 24 * 3600 if provider == "soynade" else 3600
+    await store.set_json(key, {"audio": base64.b64encode(content).decode("ascii"), "type": media_type}, ttl=ttl)
     return Response(content=content, media_type=media_type)

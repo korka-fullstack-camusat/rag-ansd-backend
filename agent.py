@@ -38,7 +38,7 @@ from fastindex import doc_year, has_value, keywords, period_label, pub_date
 logger = logging.getLogger("ansd-agent")
 
 AGENT_ENABLED = os.environ.get("AGENT_ENABLED", "1").strip().lower() not in {"0", "false", "no", ""}
-AGENT_VERSION = "v4"  # dans la cle de cache des reponses : a changer quand le comportement de l'agent change
+AGENT_VERSION = "v5"  # dans la cle de cache des reponses : a changer quand le comportement de l'agent change
 # Fournisseur principal : Mistral (API directe). OpenRouter sert de secours (modele AGENT_MODEL).
 MISTRAL_BASE_URL = os.environ.get("MISTRAL_BASE_URL", "https://api.mistral.ai/v1").rstrip("/")
 # Version datee (et non « -latest ») : le comportement ne change pas a l'insu du projet.
@@ -241,7 +241,9 @@ Ne cite que les passages réellement utilisés. N'écris jamais de titre de docu
 les sources s'affichent automatiquement sous ta réponse.
 
 STYLE
-- Réponds dans la langue de l'utilisateur ({language}). Ton direct et bienveillant ; vouvoie sauf si la personne te tutoie.
+- LANGUE : réponds TOUJOURS et entièrement en {language}, la langue choisie dans l'interface, même si la question, \
+la conversation précédente ou les passages sont dans une autre langue (l'utilisateur peut changer de langue en cours \
+de discussion : la langue choisie l'emporte toujours). Ton direct et bienveillant ; vouvoie sauf si la personne te tutoie.
 - Court par défaut (2 à 5 phrases) : l'essentiel d'abord (valeur, unité, période), puis un éclairage utile si les \
 passages le donnent. Plus long seulement si on te le demande. Respecte le format demandé (liste, tableau Markdown…).
 - Pas de « selon les extraits » ni de vocabulaire technique (passage, recherche automatique, outil).
@@ -602,6 +604,29 @@ def finalize(raw: str, run: _Run, question: str) -> dict:
 # ------------------------------------------------------------------ boucle de l'agent
 
 
+_FRENCH_MARKERS = {
+    "le", "la", "les", "des", "est", "sont", "une", "du", "au", "aux", "pour", "dans", "avec", "par", "selon",
+    "taux", "chômage", "chomage", "deuxième", "trimestre", "année", "habitants", "vous", "souhaitez",
+}
+_ENGLISH_MARKERS = {
+    "the", "is", "are", "was", "were", "of", "and", "in", "for", "with", "according", "rate", "unemployment",
+    "quarter", "year", "inhabitants", "you", "would", "like",
+}
+
+
+def _wrong_language(answer: str, language: str) -> bool:
+    """Reponse visiblement ecrite dans l'autre langue (francais <-> anglais), apres un changement
+    de langue dans l'interface. Les langues traduites (wolof, pulaar) passent par le francais."""
+    if language not in ("fr", "en"):
+        return False
+    words = re.findall(r"[a-zàâçéèêëîïôûùüÿœ']+", answer.lower())
+    if len(words) < 6:
+        return False
+    fr = sum(w in _FRENCH_MARKERS for w in words) / len(words)
+    en = sum(w in _ENGLISH_MARKERS for w in words) / len(words)
+    return fr > en * 2 and fr > 0.08 if language == "en" else en > fr * 2 and en > 0.08
+
+
 def _history_messages(history: list[dict]) -> list[dict]:
     messages: list[dict] = []
     for turn in history[-MAX_HISTORY_TURNS:]:
@@ -629,7 +654,10 @@ async def agent_events(
         language=rag.LANGUAGE_NAMES.get(language, "français"),
     )
     messages: list[dict] = [{"role": "system", "content": system}, *_history_messages(history)]
-    messages.append({"role": "user", "content": question})
+    # Rappel de la langue juste apres la question : sans lui, le modele suit la langue de la question
+    # ou de l'historique quand l'utilisateur vient de changer de langue dans l'interface.
+    language_name = rag.LANGUAGE_NAMES.get(language, "français")
+    messages.append({"role": "user", "content": f"{question}\n\n(Langue de réponse : {language_name}.)"})
 
     # Recherche anticipee, presentee au modele comme sa propre premiere recherche.
     args = prefetch_args(question, history)
@@ -683,6 +711,20 @@ async def agent_events(
         # Garde-fou : un chiffre qui ne figure dans aucun passage obtenu est une invention possible ;
         # un chiffre absent des passages que la reponse cite est souvent pris a une autre periode.
         unsupported = run.unsupported_figures(raw, allowed) if raw else []
+        if raw and corrections < 2 and not last and _wrong_language(raw, language):
+            corrections += 1
+            if streamed:
+                yield {"type": "reset"}
+            messages.append({"role": "assistant", "content": raw})
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"(Rappel système : la langue choisie dans l'interface est le {language_name}. Réécris toute ta "
+                    f"réponse en {language_name}, avec les mêmes chiffres et les mêmes références [n], sans mentionner "
+                    "ce rappel.)"
+                ),
+            })
+            continue
         misattributed = [] if unsupported else run.misattributed_figures(raw, allowed)
         if misattributed and corrections < 2 and not last:
             corrections += 1

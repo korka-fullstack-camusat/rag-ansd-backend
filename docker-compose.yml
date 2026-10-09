@@ -1,6 +1,9 @@
 # Backend seul :  docker compose up --build -d   (dans ce dossier)
 # API : http://localhost:8000  —  docs : http://localhost:8000/docs
 # Plusieurs instances derriere un repartiteur de charge : docker-compose.scale.yml
+# Nom de projet propre : evite toute confusion avec un autre projet dont le dossier s appelle aussi « backend ».
+name: ansd-backend
+
 services:
   backend:
     build: .
@@ -14,6 +17,9 @@ services:
       WEB_CONCURRENCY: ${WEB_CONCURRENCY:-4}
       RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-20}
       RATE_LIMIT_IP_PER_MINUTE: ${RATE_LIMIT_IP_PER_MINUTE:-600}
+      # Modeles locaux (service local-models ci-dessous) : voix wolof de secours, traduction pulaar
+      LOCAL_TTS_URL: http://local-models:8001
+      LOCAL_MT_URL: http://local-models:8001
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     volumes:
@@ -24,6 +30,7 @@ services:
       - fastindex-data:/app/fastindex
     depends_on:
       - redis
+      - local-models
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
       interval: 15s
@@ -39,8 +46,26 @@ services:
     command: ["redis-server", "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lru", "--save", ""]
     restart: unless-stopped
 
+  # Modeles locaux sur CPU : voix wolof (SpeechT5, MIT) quand Soynade est indisponible, et traduction
+  # francais <-> pulaar (NLLB-600M + adaptateur LoRA, CC-BY-NC).
+  # Pas de port publie : seul le backend l appelle. Modeles (~3 Go) gardes dans un volume (~4 Go de RAM).
+  local-models:
+    build: ./local_models
+    container_name: ansd-local-models
+    environment:
+      TTS_WORKERS: ${TTS_WORKERS:-6}
+      TTS_THREADS: ${TTS_THREADS:-3}
+      TTS_SPEED: ${TTS_SPEED:-1.25}
+      TTS_STRETCH: ${TTS_STRETCH:-rubberband}
+      TTS_DENOISE: ${TTS_DENOISE:-0}
+    volumes:
+      - local-models-cache:/models
+    restart: unless-stopped
+
 volumes:
   fastembed-models:
     name: ansd-fastembed-models
   fastindex-data:
     name: ansd-fastindex
+  local-models-cache:
+    name: ansd-tts-models

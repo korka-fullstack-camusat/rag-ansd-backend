@@ -24,6 +24,8 @@ from pathlib import Path
 
 import httpx
 
+import figures
+
 logger = logging.getLogger("ansd-voice")
 
 SOYNADE_BASE_URL = os.environ.get("SOYNADE_BASE_URL", "https://api.soynade.ai").rstrip("/")
@@ -39,6 +41,11 @@ NOT_CONFIGURED = "Le mode vocal n'est pas encore configuré sur ce serveur."
 SERVICE_ERROR = "Le service vocal est momentanément indisponible. Veuillez réessayer."
 BAD_AUDIO = "L'enregistrement n'a pas pu être lu. Veuillez réessayer."
 EMPTY_TEXT = "Aucun texte à lire."
+QUOTA_EXHAUSTED = (
+    "La lecture audio en wolof est momentanément indisponible (limite quotidienne du service vocal atteinte). "
+    "Réessayez dans quelques heures."
+)
+_tts_blocked_until = 0.0  # quota de synthese vocale epuise : pas d'appel avant cet instant (time.monotonic)
 
 
 class VoiceError(Exception):
@@ -157,14 +164,41 @@ def _truncate(text: str, limit: int) -> str:
     return head[: ends[-1]].strip() if ends else head.rsplit(" ", 1)[0]
 
 
-async def synthesize(text: str, language: str) -> tuple[bytes, str]:
-    """Audio (octets, type MIME) de `text` lu en `language`."""
-    key = _api_key()
+# Voix wolof locale (service tts-wolof, voir tts/app.py) : prend le relais quand Soynade est
+# indisponible (quota epuise, panne, cle absente). Vide = pas de secours.
+LOCAL_TTS_URL = os.environ.get("LOCAL_TTS_URL", "").strip().rstrip("/")
+LOCAL_TTS_TIMEOUT = 120
+
+
+async def synthesize(text: str, language: str) -> tuple[bytes, str, str]:
+    """Audio (octets, type MIME, fournisseur « soynade » ou « local ») de `text` lu en `language`."""
     if language not in TTS_LANGUAGES:
         raise VoiceError(501, UNAVAILABLE)
+    try:
+        content, media_type = await _soynade_synthesize(text, language)
+        return content, media_type, "soynade"
+    except VoiceError as exc:
+        if exc.status == 400 or not LOCAL_TTS_URL:
+            raise
+        try:
+            resp = await _http().post(f"{LOCAL_TTS_URL}/speak", json={"text": text}, timeout=LOCAL_TTS_TIMEOUT)
+        except httpx.HTTPError:
+            logger.warning("voix wolof locale injoignable")
+            raise exc
+        if resp.status_code != 200:
+            logger.warning("voix wolof locale indisponible (HTTP %s)", resp.status_code)
+            raise exc
+        return resp.content, resp.headers.get("content-type", "audio/wav"), "local"
+
+
+async def _soynade_synthesize(text: str, language: str) -> tuple[bytes, str]:
+    key = _api_key()
     text = _truncate(text, TTS_MAX_CHARS)
     if not text:
         raise VoiceError(400, EMPTY_TEXT)
+    global _tts_blocked_until
+    if time.monotonic() < _tts_blocked_until:
+        raise VoiceError(503, QUOTA_EXHAUSTED)
     try:
         resp = await _http().post(
             f"{SOYNADE_BASE_URL}/v1/text-to-speech",
@@ -175,8 +209,20 @@ async def synthesize(text: str, language: str) -> tuple[bytes, str]:
     except httpx.HTTPError:
         logger.warning("soynade: synthese injoignable")
         raise VoiceError(502, SERVICE_ERROR)
+    if resp.status_code == 429 and _retry_after(resp) > 30:
+        # Quota (journalier) epuise : plus d'appel jusqu'a l'heure indiquee, message clair a l'utilisateur.
+        _tts_blocked_until = time.monotonic() + _retry_after(resp)
+        logger.warning("soynade: quota de synthese vocale epuise, suspendu %.0f min", _retry_after(resp) / 60)
+        raise VoiceError(503, QUOTA_EXHAUSTED)
     _check_response(resp)
     return resp.content, resp.headers.get("content-type", "audio/mpeg")
+
+
+def _retry_after(resp: httpx.Response) -> float:
+    try:
+        return float(resp.headers.get("retry-after") or 0)
+    except ValueError:
+        return 0.0
 
 
 # ---------------------------------------------------------------- traduction (wolof)
@@ -331,6 +377,114 @@ async def to_wolof(text_fr: str) -> str:
         _cache_put("fr", "wo-llm", text_fr, out)
         return out
     return text_fr
+
+
+# ---------------------------------------------------------------- traduction (pulaar)
+# Modele local (service local-models : NLLB-600M + adaptateur LoRA pulaar). Les reponses sont
+# traduites phrase par phrase, en un seul lot ; une phrase dont un chiffre ne se retrouve pas dans la
+# traduction reste en francais (le modele, experimental, peut deformer ou inventer).
+LOCAL_MT_URL = os.environ.get("LOCAL_MT_URL", "").strip().rstrip("/")
+LOCAL_MT_TIMEOUT = 120
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
+_LIST_PREFIX = re.compile(r"^(\s*(?:[-*•]|\d+[.)])\s+)?(.*)$")
+
+
+async def _local_translate(texts: list[str], source: str, target: str) -> list[str] | None:
+    if not LOCAL_MT_URL or not texts:
+        return None
+    try:
+        resp = await _http().post(
+            f"{LOCAL_MT_URL}/translate", json={"texts": texts, "source": source, "target": target}, timeout=LOCAL_MT_TIMEOUT
+        )
+    except httpx.HTTPError:
+        logger.warning("traduction locale injoignable")
+        return None
+    if resp.status_code != 200:
+        logger.warning("traduction locale indisponible (HTTP %s)", resp.status_code)
+        return None
+    out = resp.json().get("texts")
+    return out if isinstance(out, list) and len(out) == len(texts) else None
+
+
+def _same_figures(source: str, translated: str) -> bool:
+    return figures.figure_set(source) <= figures.figure_set(translated)
+
+
+async def to_pulaar(text_fr: str) -> str:
+    """Traduction francais -> pulaar d'une reponse ; listes et lignes conservees, tableaux laisses en
+    francais. Le francais d'origine si le service local est indisponible."""
+    key = ("fr", "ff", text_fr)
+    if (hit := _cached(key)) is not None:
+        return hit
+    lines = text_fr.replace("**", "").split("\n")
+    layout: list[tuple[str, int, int] | str] = []  # (prefixe, debut, nombre) ou ligne gardee telle quelle
+    sentences: list[str] = []
+    for line in lines:
+        if not line.strip() or line.lstrip().startswith("|"):
+            layout.append(line)
+            continue
+        prefix, body = _LIST_PREFIX.match(line).groups()
+        parts = [s for s in _SENTENCE_SPLIT.split(body) if s.strip()]
+        layout.append((prefix or "", len(sentences), len(parts)))
+        sentences.extend(parts)
+    translated = await _local_translate(sentences, "fr", "ff")
+    if translated is None:
+        return text_fr
+    kept = [t if t.strip() and _same_figures(s, t) else s for s, t in zip(sentences, translated)]
+    out = "\n".join(
+        item if isinstance(item, str) else item[0] + " ".join(kept[item[1] : item[1] + item[2]]) for item in layout
+    )
+    _cache_put("fr", "ff", text_fr, out)
+    return out
+
+
+_PULAAR_FRENCH_SYSTEM = (
+    "Tu es un traducteur professionnel pulaar (peul du Senegal, Fuuta Tooro) -> francais. Le texte est un message "
+    "ecrit a l'assistant statistique de l'ANSD (Senegal), souvent en orthographe libre et sans accents "
+    "(ex. « mido falla andu » = « je veux savoir »). Traduis-le fidelement en francais clair, en gardant tels quels "
+    "les chiffres, noms de lieux et sigles. Si le texte est deja en francais, renvoie-le tel quel. "
+    "Reponds uniquement par la traduction."
+)
+
+
+_TITLE_LANGUAGES = {
+    "en": "anglais",
+    "wo": "wolof du Senegal (orthographe officielle du CLAD : à, é, ë, ó, ñ, ŋ, x)",
+    "ff": "pulaar du Senegal (Fuuta Tooro, orthographe officielle : ɓ, ɗ, ƴ, ŋ, ñ)",
+}
+
+
+async def translate_title(title_fr: str, language: str) -> str:
+    """Titre court de discussion (1 a 3 mots) traduit pour l'historique ; le francais en cas d'echec."""
+    target = _TITLE_LANGUAGES.get(language)
+    if not target:
+        return title_fr
+    out = await _llm_translate(
+        f"Traduis ce titre de discussion (1 a 3 mots, sujet statistique) du francais vers le {target}. "
+        "Reponds uniquement par le titre traduit, sans guillemets ni ponctuation finale.",
+        title_fr,
+    )
+    out = (out or "").strip().strip("\"'«»“”.").strip()
+    return out[:60] if out and len(out.split()) <= 6 else title_fr
+
+
+async def pulaar_to_french(text: str) -> str:
+    """Question pulaar -> francais : le modele de langage (Gemini), qui comprend le pulaar ecrit librement
+    (« mido falla andu… ») bien mieux que NLLB ; NLLB local en secours. Le texte tel quel s'il est deja
+    en francais ou si les deux traductions echouent."""
+    if _french_ratio(text) > 0.25:
+        return text
+    key = ("ff", "fr", text)
+    if (hit := _cached(key)) is not None:
+        return hit
+    out = await _llm_translate(_PULAAR_FRENCH_SYSTEM, text)
+    if not out or not numbers_preserved(text, out):
+        translated = await _local_translate([text], "ff", "fr")
+        out = translated[0] if translated and translated[0].strip() else None
+    if not out:
+        return text
+    _cache_put("ff", "fr", text, out)
+    return out
 
 
 async def to_french(text_wo: str, timeout: float = TRANSLATE_TIMEOUT) -> str:

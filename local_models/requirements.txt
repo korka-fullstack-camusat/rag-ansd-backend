@@ -1,0 +1,8 @@
+transformers==4.46.3
+sentencepiece==0.2.0
+num2words==0.5.13
+numpy<2.3
+fastapi
+uvicorn[standard]
+imageio-ffmpeg==0.5.1
+peft==0.13.2

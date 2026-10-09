@@ -7,3 +7,4 @@ storage/
 data/
 .DS_Store
 fastindex/
+local_models/
