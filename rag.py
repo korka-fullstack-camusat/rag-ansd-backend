@@ -118,6 +118,8 @@ def link_references(text: str, hits: list[dict]) -> tuple[str, list[dict]]:
         refs = dict.fromkeys(ref_for(int(n)) for n in re.findall(r"\d+", match.group(1)))
         return "".join(r for r in refs if r)
 
+    # Le modele ecrit parfois deja « [[2]] » : ramene a « [2] » pour eviter des crochets en trop.
+    text = re.sub(r"\[\[(\d+)\]\]", r"[\1]", text)
     linked = _REF_GROUP.sub(replace, text)
     linked = re.sub(r"\s+(\[\[\d+\]\])", r"\1", linked)  # colle la reference au texte
     linked = "\n".join(_dedupe_refs(line) for line in linked.split("\n"))
@@ -485,24 +487,28 @@ def corpus_reply(question: str, language: str) -> str | None:
 
 
 # --- demandes de conseil / mode d'emploi (« que me conseillez-vous en tant que debutant
-# pour recuperer les donnees ? », « ou trouver les chiffres de l'emploi ? »). Ce ne sont
-# pas des demandes de chiffres : la recherche documentaire n'y trouve rien et la reponse
-# serait « pas de donnees ». Le modele repond alors en guide, a partir de la liste des
-# publications reellement indexees, sans jamais donner de chiffre.
+# pour recuperer les donnees ? », « donnez-moi les etapes a suivre pour mes recherches »).
+# Ce ne sont pas des demandes de chiffres : la recherche documentaire n'y trouve rien et la
+# reponse serait « pas de donnees ». Le modele repond alors en guide, sans jamais donner de
+# chiffre, en recommandant des publications reelles de la base avec un lien vers chacune.
 _GUIDE_Q = re.compile(
-    r"\b(conseill\w+|(un|des|quels?|quelques|vos|tes|tous|meilleurs?) conseils?|recommand\w*|astuces?|sugger\w*|advice|advise|recommend\w*|tips?|suggest\w*)\b"
+    r"\b(conseill\w+|(un|des|quels?|quelques|vos|tes|tous|meilleurs?) conseils?|recommand\w*|astuces?|"
+    r"sugger\w*|advice|advise|recommend\w*|tips?|suggest\w*)\b"
     r"|\b(debutants?|novices?|neophytes?|beginners?|newbies?|premiers? pas|par ou commencer|"
     r"comment commencer|comment debuter|get(ting)? started|where (do i|to|should i) start)\b"
+    r"|\b(etapes? a suivre|les etapes|des etapes|une etape|marche a suivre|demarches?|plan de recherche|"
+    r"feuille de route|guide[sz]? moi|guider|m orienter|oriente[sz]? moi|orientations?|aide[sz]? moi|"
+    r"m aider|mes recherches|ma recherche|mon etude|mon memoire|ma these|steps?|roadmap|guide me|help me)\b"
     r"|\b(comment|ou|ou est ce que|how (do i|can i|to|should i)|where (can i|do i|to))\b.*"
     r"\b(recuper\w*|acced\w*|acces|obten\w*|trouv\w*|telecharg\w*|utilis\w*|exploit\w*|lire|interpret\w*|"
     r"analys\w*|citer|get|find|access|download|use|read|interpret|cite)\b.*"
     r"\b(donnees?|statistiques?|chiffres?|publications?|rapports?|bulletins?|microdonnees?|bases?|"
     r"indicateurs?|enquetes?|data|statistics|figures|reports?|surveys?|indicators?)\b"
-    r"|\b(methodologie|demarche|bonnes pratiques|methodology|best practices?)\b"
+    r"|\b(methodologie|bonnes pratiques|methodology|best practices?)\b"
 )
 # Une vraie demande de chiffre (« quel est le taux… », « combien… ») reste une question
 # sur les donnees, meme si elle contient « conseil » (ex. « Conseil economique… »).
-_FIGURE_Q = re.compile(r"^(quel(le)?s? (est|sont|etait|a ete)|combien|what (is|was|are)|how (much|many))\b")
+_FIGURE_Q = re.compile(r"^(quel(le)?s? (est|sont|etait|etaient|a ete)|combien|what (is|was|are)|how (much|many))\b")
 
 
 def guidance_question(question: str) -> bool:
@@ -512,82 +518,166 @@ def guidance_question(question: str) -> bool:
     return bool(_GUIDE_Q.search(text))
 
 
-def publication_series(limit: int = 40) -> list[str]:
-    """Grandes series de publications du corpus (titres sans date ni periode)."""
-    counts: dict[str, int] = {}
+def guidance_follow_up(question: str, history: list[dict]) -> bool:
+    """Reponse courte a une demande de precision du guide (« sur l'emploi », « pour
+    mon memoire sur la sante ») : l'accompagnement continue, adapte a ce sujet."""
+    if not history or not guidance_question(history[-1]["question"]):
+        return False
+    text = _norm(question)
+    return bool(text) and len(text.split()) <= 12 and not _FIGURE_Q.search(text)
+
+
+_MONTHS_OR_QUARTER = re.compile(
+    r"\s+(janvier|fevrier|février|mars|avril|mai|juin|juillet|aout|août|septembre|"
+    r"octobre|novembre|decembre|décembre|T[1-4])$",
+    re.IGNORECASE,
+)
+_title_urls: dict[str, str] = {}
+
+
+def title_urls() -> dict[str, str]:
+    """{titre de publication: lien officiel (PDF)}, lu une fois dans la base."""
+    if not _title_urls:
+        con = sqlite3.connect(f"file:{CHROMA_DIR / 'chroma.sqlite3'}?mode=ro", uri=True, timeout=60)
+        try:
+            rows = con.execute(
+                "SELECT DISTINCT s.string_value, u.string_value FROM embedding_metadata s "
+                "JOIN embedding_metadata u ON u.id = s.id AND u.key = 'url' WHERE s.key = 'source'"
+            )
+            _title_urls.update({title: url for title, url in rows if title and url})
+        finally:
+            con.close()
+    return _title_urls
+
+
+def _series_name(title: str) -> str:
+    name = re.sub(r"\s*\(?\b(?:19|20)\d{2}\b.*$", "", title).strip(" -_,(")
+    name = _MONTHS_OR_QUARTER.sub("", name)
+    return re.split(r"[,(_]", name)[0].strip(" -")
+
+
+def series_latest(limit: int = 12) -> list[dict]:
+    """Grandes series de publications du corpus, chacune avec sa publication la plus
+    recente : [{'series', 'source', 'url'}]."""
+    groups: dict[str, list[str]] = {}
     labels: dict[str, str] = {}
     for title in corpus_index()["titles"]:
-        name = re.sub(r"\s*\(?\b(?:19|20)\d{2}\b.*$", "", title).strip(" -_,(")
-        name = re.sub(r"\s+(janvier|fevrier|février|mars|avril|mai|juin|juillet|aout|août|septembre|"
-                      r"octobre|novembre|decembre|décembre|T[1-4])$", "", name, flags=re.IGNORECASE)
-        name = re.split(r"[,(_]", name)[0].strip(" -")
-        if len(name) >= 4:
-            key = _norm(name)
-            counts[key] = counts.get(key, 0) + 1
-            labels.setdefault(key, name)
-    return [labels[k] for k, _ in sorted(counts.items(), key=lambda kv: -kv[1])[:limit]]
+        name = _series_name(title)
+        if len(name) < 4:
+            continue
+        key = _norm(name)
+        groups.setdefault(key, []).append(title)
+        labels.setdefault(key, name)
+    urls = title_urls()
+    out = []
+    for key, titles in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        dated = [t for t in titles if t in urls]
+        if not dated:
+            continue
+        latest = max(dated, key=lambda t: max((int(y) for y in _YEAR_RE.findall(t)), default=0))
+        out.append({"series": labels[key], "source": latest, "url": urls[latest]})
+        if len(out) >= limit:
+            break
+    return out
+
+
+def guidance_resources(question: str, limit: int = 12) -> list[dict]:
+    """Publications a recommander, avec leur lien : d'abord celles dont le contenu est le
+    plus proche de la demande, puis la derniere parution des grandes series."""
+    resources: list[dict] = []
+    seen: set[str] = set()
+    try:
+        near = retrieve(question, top_k=20)
+    except Exception:
+        near = []
+    picked: list[dict] = []
+    for h in near:
+        if h.get("url") and h["source"] not in seen and len(picked) < 6:
+            seen.add(h["source"])
+            picked.append({"source": h["source"], "url": h["url"], "page": None, "series": None})
+    # Les plus recentes d'abord : le modele recommande en priorite les parutions recentes.
+    picked.sort(key=lambda r: -max((int(y) for y in _YEAR_RE.findall(r["source"])), default=0))
+    resources.extend(picked)
+    for item in series_latest(limit):
+        if item["source"] not in seen and len(resources) < limit:
+            seen.add(item["source"])
+            resources.append({**item, "page": None})
+    return resources
 
 
 GUIDE_PROMPT = (
     "Tu es l'assistant de l'ANSD (Agence Nationale de la Statistique et de la Demographie du "
-    "Senegal). L'utilisateur ne demande pas un chiffre mais un conseil : comment trouver, "
-    "recuperer, lire ou utiliser les statistiques de l'ANSD. Donne des conseils concrets, "
-    "bienveillants et adaptes a son niveau. "
+    "Senegal). L'utilisateur ne demande pas un chiffre mais un accompagnement : comment mener ses "
+    "recherches, trouver, recuperer, lire ou utiliser les statistiques de l'ANSD. Sois concret, "
+    "bienveillant et adapte a son niveau. "
     "REGLES : ne donne AUCUN chiffre statistique (ni valeur, ni taux, ni effectif) ; n'invente "
-    "aucun nom de publication, aucune adresse web et aucune procedure : le seul site que tu peux "
-    "citer est www.ansd.sn (rubrique des publications). Pour nommer des publications, utilise "
-    "uniquement les listes fournies, en priorite les publications proches de la demande ; "
-    "ne suppose jamais ce que contient une publication au-dela de ce qu'indique son titre. "
-    "Pistes utiles (a choisir selon la question) : partir d'une question precise (indicateur, "
-    "zone, periode) ; commencer par les publications de synthese (Reperes statistiques, Bulletin "
-    "mensuel des statistiques economiques et financieres, chapitres de la Situation economique et "
-    "sociale - SES) avant les rapports detailles d'enquete ou de recensement ; lire les notes "
-    "methodologiques et les definitions ; verifier l'unite, la periode, le champ et l'annee de "
-    "base des indices ; preferer la publication la plus recente et noter les chiffres provisoires "
-    "ou revises ; toujours citer le document et la page ; pour des fichiers de microdonnees "
-    "d'enquete, se renseigner aupres de l'ANSD sur les conditions d'acces. "
-    "Rappelle enfin qu'il peut poser ici des questions chiffrees, l'assistant repondant a partir "
-    "des publications officielles avec le document et la page, et termine TOUJOURS par 2 exemples "
-    "de questions chiffrees en rapport avec sa demande, sur une ligne commencant par « Par exemple : » "
-    "(ex. « Quel était le taux de chômage au 2e trimestre 2024 ? »), sans y repondre. "
-    "FORMAT : court et lisible (une phrase d'introduction puis 4 a 6 points avec « - », 150 mots "
-    "environ au plus), sans titre Markdown."
+    "aucun nom de publication, aucune adresse web et aucune procedure ; le seul site que tu peux "
+    "nommer est www.ansd.sn. Ne recommande QUE des publications de la liste numerotee fournie et "
+    "mets son numero entre crochets juste apres son nom, ex. « le Bulletin mensuel [3] » : un lien "
+    "vers le document sera affiche a cet endroit. Ne suppose jamais ce que contient une "
+    "publication au-dela de ce qu'indique son titre. "
+    "Pistes utiles (selon la demande) : partir d'une question precise (indicateur, zone, periode) ; "
+    "commencer par les publications de synthese (Reperes statistiques, Bulletin mensuel des "
+    "statistiques economiques et financieres, chapitres de la Situation economique et sociale - SES) "
+    "avant les rapports detailles d'enquete ou de recensement ; lire les notes methodologiques et "
+    "les definitions ; verifier l'unite, la periode, le champ et l'annee de base des indices ; "
+    "preferer la publication la plus recente et noter les chiffres provisoires ou revises ; "
+    "toujours citer le document et la page ; pour des microdonnees d'enquete, se renseigner aupres "
+    "de l'ANSD sur les conditions d'acces ; poser ici des questions chiffrees, l'assistant "
+    "repondant a partir des publications avec le document et la page. "
+    "FORMAT : une phrase d'introduction, puis une liste numerotee « 1. », « 2. »… d'etapes dans "
+    "l'ordre (4 a 6 etapes) si l'utilisateur demande une demarche ou des etapes, sinon 4 a 6 points "
+    "avec « - » ; chaque etape tient en une ou deux phrases et recommande si possible une "
+    "publication avec son numero. Pas de titre Markdown, 200 mots environ au plus. "
+    "INTERACTIVITE : termine par une ligne « Par exemple : » suivie de 2 questions demandant un "
+    "chiffre precis (commencant par « Quel », « Quelle » ou « Combien », avec un indicateur et une "
+    "periode), puis, si le sujet de ses recherches n'est pas encore connu, une courte question pour "
+    "le lui demander (theme, zone, periode) afin d'affiner les conseils."
 )
 
 
-def _guide_messages(question: str, language: str, history: list[dict] | None = None) -> list[dict]:
-    series = "\n".join(f"- {name}" for name in publication_series())
-    # Publications dont le contenu est le plus proche de la demande (ex. emploi → SES Emploi).
-    try:
-        near = list(dict.fromkeys(h["source"] for h in retrieve(question, top_k=12)))[:6]
-    except Exception:
-        near = []
-    nearby = "".join(f"- {title}\n" for title in near)
+_STEPS_Q = re.compile(r"\b(etapes?|demarches?|marche a suivre|plan|feuille de route|steps?|roadmap)\b")
+
+
+def _guide_messages(question: str, language: str, resources: list[dict], history: list[dict] | None = None) -> list[dict]:
+    listing = "\n".join(
+        f"[{i}] {r['source']}" + (f" (derniere parution de la serie « {r['series']} »)" if r.get("series") else "")
+        for i, r in enumerate(resources, 1)
+    )
     context = ""
     if history:
         last = history[-1]
-        context = f"Echange precedent - question : {last['question']}\nreponse : {last['answer'][:600]}\n\n"
+        context = (
+            f"Echange precedent (accompagnement en cours) - question : {last['question']}\n"
+            f"reponse : {last['answer'][:800]}\n\n"
+        )
     return [
         {"role": "system", "content": GUIDE_PROMPT},
         {
             "role": "user",
             "content": (
-                f"Series de publications de l'ANSD disponibles dans la base :\n{series}\n\n"
-                + (f"Publications de la base les plus proches de la demande :\n{nearby}\n" if nearby else "")
-                + f"{context}Demande : {question}\n\n"
-                f"Reponds en {LANGUAGE_NAMES.get(language, 'francais')}. Derniere ligne : « Par exemple : » "
-                "suivi de 2 questions demandant un CHIFFRE precis (commencant par « Quel », « Quelle » "
-                "ou « Combien », avec un indicateur et une periode), sans y repondre."
+                f"Publications de la base, numerotees (a citer par leur numero) :\n{listing}\n\n"
+                f"{context}Demande : {question}\n\n"
+                + ("Presente ta reponse comme une liste NUMEROTEE d'etapes (1., 2., 3.…).\n"
+                   if _STEPS_Q.search(_norm(f"{context} {question}")) else "")
+                + f"Reponds en {LANGUAGE_NAMES.get(language, 'francais')}."
             ),
         },
     ]
 
 
-async def aguidance(question: str, language: str = "fr", history: list[dict] | None = None) -> dict:
-    """Conseils d'utilisation des statistiques de l'ANSD (pas de recherche documentaire)."""
-    return await _achat(
-        await asyncio.to_thread(_guide_messages, question, language, history), temperature=0.3, max_tokens=450
+async def aguidance(
+    question: str, language: str = "fr", history: list[dict] | None = None
+) -> tuple[str, list[dict], str]:
+    """Accompagnement (conseils, etapes) : (texte avec references [[n]], sources liees, modele).
+    Pas de recherche de chiffres ; chaque publication recommandee renvoie a son document."""
+    search = f"{history[-1]['question']} {question}" if history else question
+    resources = await asyncio.to_thread(guidance_resources, search)
+    completion = await _achat(
+        _guide_messages(question, language, resources, history), temperature=0.3, max_tokens=600
     )
+    text, sources = link_references(completion["choices"][0]["message"]["content"].strip(), resources)
+    return text, sources, completion.get("model", OPENROUTER_MODEL)
 
 
 # --- demandes de mise en forme seules (« point par point », « en tableau »…)

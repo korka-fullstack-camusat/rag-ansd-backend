@@ -45,6 +45,7 @@ from rag import (
     format_only_clause,
     period_only,
     with_period,
+    guidance_follow_up,
     guidance_question,
     small_talk_reply,
     split_used_sources,
@@ -145,11 +146,19 @@ class Usage(BaseModel):
     total_tokens: int = 0
 
 
+class DetailSource(BaseModel):
+    n: int
+    title: str
+    page: int | None = None
+    url: str | None = None
+
+
 class QueryResponse(BaseModel):
     question: str
     # answer : reponse tiree des publications ; no_data : rien dans le corpus ;
-    # chat : conversation courante (« bonjour », « merci »…), sans recherche.
-    kind: Literal["answer", "no_data", "chat"] = "answer"
+    # chat : conversation courante (« bonjour », « merci »…), sans recherche ;
+    # guide : conseils et etapes pour mener ses recherches, sans chiffre.
+    kind: Literal["answer", "no_data", "chat", "guide"] = "answer"
     # Question reformulee de maniere autonome (questions de suite), utilisee pour
     # la recherche ; reprise par « Voir plus ».
     standalone_question: str | None = None
@@ -160,6 +169,8 @@ class QueryResponse(BaseModel):
     sources_used: list[str]
     model: str
     usage: Usage
+    # Reponses « guide » : publications recommandees, referencees [[n]] dans le texte.
+    sources: list[DetailSource] = Field(default_factory=list)
 
 
 class SourceDocument(BaseModel):
@@ -394,21 +405,27 @@ async def _query(
             question=question, language=req.language, kind="chat", answered=False, answer=about_corpus,
             citations=[], sources_used=[], model="", usage=Usage(),
         )
-    if guidance_question(question):
-        # Demande de conseil (« que me conseillez-vous pour recuperer les donnees ? ») :
-        # reponse de guide, sans recherche documentaire ni chiffre.
-        history = [t.model_dump() for t in req.history if t.answer.strip()][-1:]
+    last_turn = [t.model_dump() for t in req.history if t.answer.strip()][-1:]
+    guide_follow_up = guidance_follow_up(question, last_turn)
+    if guide_follow_up or guidance_question(question):
+        # Demande de conseil ou d'etapes (« que me conseillez-vous pour recuperer les donnees ? »),
+        # ou precision apportee a une telle demande (« sur l'emploi ») : reponse de guide, sans
+        # chiffre, avec un lien vers chaque publication recommandee.
         try:
-            completion = await aguidance(question, req.language, history)
-            advice = completion["choices"][0]["message"]["content"].strip()
+            advice, guide_sources, model = await aguidance(
+                question, req.language, last_turn if guide_follow_up else None
+            )
         except Exception:
             logger.exception("guidance failed")
             advice = ""
         if advice:
             analytics.log_event("chat", client_id=x_client_id, session_id=x_session_id, question=question, language=req.language)
             return QueryResponse(
-                question=question, language=req.language, kind="chat", answered=False, answer=advice,
-                citations=[], sources_used=[], model=completion.get("model", OPENROUTER_MODEL), usage=Usage(),
+                question=question, language=req.language, kind="guide", answered=False, answer=advice,
+                citations=[], sources_used=[], model=model, usage=Usage(), sources=guide_sources,
+                # Demande complete (« etapes pour mes recherches — sur l'emploi ») : renvoyee comme
+                # question de l'echange, elle garde l'accompagnement actif pour les precisions suivantes.
+                standalone_question=f"{last_turn[0]['question']} — {question}" if guide_follow_up else None,
             )
     try:
         history = [t.model_dump() for t in req.history if t.answer.strip()][-2:]
@@ -597,13 +614,6 @@ class ExplainRequest(BaseModel):
     # Sources de la reponse courte : l'explication s'appuie d'abord sur elles.
     sources: list[SourceRef] = Field(default_factory=list, max_length=6)
     language: Literal["fr", "wo", "en", "ff", "srr", "dyo"] = "fr"
-
-
-class DetailSource(BaseModel):
-    n: int
-    title: str
-    page: int | None = None
-    url: str | None = None
 
 
 class ExplainResponse(BaseModel):
