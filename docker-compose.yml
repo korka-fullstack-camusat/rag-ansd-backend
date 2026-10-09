@@ -1,0 +1,46 @@
+# Backend seul :  docker compose up --build -d   (dans ce dossier)
+# API : http://localhost:8000  —  docs : http://localhost:8000/docs
+# Plusieurs instances derriere un repartiteur de charge : docker-compose.scale.yml
+services:
+  backend:
+    build: .
+    container_name: ansd-backend
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+      REDIS_URL: redis://redis:6379/0
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-4}
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-20}
+      RATE_LIMIT_IP_PER_MINUTE: ${RATE_LIMIT_IP_PER_MINUTE:-600}
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    volumes:
+      - ./data:/app/data
+      - ./storage:/app/storage
+      - fastembed-models:/models
+      # Index de recherche rapide (fastindex.py), construit au premier demarrage (~3 min)
+      - fastindex-data:/app/fastindex
+    depends_on:
+      - redis
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+
+  # Cache des reponses + limitation de debit, partages entre processus.
+  redis:
+    image: redis:7-alpine
+    container_name: ansd-redis
+    command: ["redis-server", "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lru", "--save", ""]
+    restart: unless-stopped
+
+volumes:
+  fastembed-models:
+    name: ansd-fastembed-models
+  fastindex-data:
+    name: ansd-fastindex

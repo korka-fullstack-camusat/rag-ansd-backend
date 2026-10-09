@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+.claude/
+storage/
+data/
+.DS_Store
+*.tar.gz
