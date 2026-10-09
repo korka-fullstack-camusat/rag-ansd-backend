@@ -38,7 +38,7 @@ from fastindex import doc_year, has_value, keywords, period_label, pub_date
 logger = logging.getLogger("ansd-agent")
 
 AGENT_ENABLED = os.environ.get("AGENT_ENABLED", "1").strip().lower() not in {"0", "false", "no", ""}
-AGENT_VERSION = "v2"  # dans la cle de cache des reponses : a changer quand le comportement de l'agent change
+AGENT_VERSION = "v4"  # dans la cle de cache des reponses : a changer quand le comportement de l'agent change
 # Fournisseur principal : Mistral (API directe). OpenRouter sert de secours (modele AGENT_MODEL).
 MISTRAL_BASE_URL = os.environ.get("MISTRAL_BASE_URL", "https://api.mistral.ai/v1").rstrip("/")
 # Version datee (et non « -latest ») : le comportement ne change pas a l'insu du projet.
@@ -224,7 +224,11 @@ RÈGLES DE FOND
 1. Tout chiffre, toute date et tout fait statistique sur le Sénégal viennent des passages obtenus, jamais de ta mémoire.
 2. Sois exact sur le périmètre : lieu (national, région, commune), période, population, unité, définition. Si les \
 passages donnent le niveau national alors qu'on demande une région, ou une autre année, dis-le au lieu de substituer. \
-Si tu ne trouves pas, dis-le franchement et propose une piste.
+Si tu ne trouves pas, dis-le franchement et brièvement ; tu peux seulement proposer un indicateur voisin \
+présent dans les publications de l'ANSD.
+7. Tu te limites strictement à la base documentaire de l'ANSD : ne renvoie jamais vers des sources externes, des sites, \
+des annuaires, des moteurs de recherche ou d'autres organismes, ne propose pas de chercher ailleurs, et ne réponds pas \
+avec tes connaissances générales (personnes, actualité, autres pays…).
 3. Quand on te demande un taux, un niveau ou un effectif, donne la valeur chiffrée (pas une simple tendance), celle de la \
 période la plus récente parmi les passages (compare les périodes indiquées : « 2e trimestre 2026 » est plus récent que \
 « 1er trimestre 2026 »), avec sa période ; signale brièvement les divergences entre publications (provisoire, révision).
@@ -242,7 +246,9 @@ STYLE
 passages le donnent. Plus long seulement si on te le demande. Respecte le format demandé (liste, tableau Markdown…).
 - Pas de « selon les extraits » ni de vocabulaire technique (passage, recherche automatique, outil).
 - Une question de suite (« et pour les jeunes ? », « en tableau ») se rattache à la conversation.
-- Hors sujet : dis-le aimablement et rappelle que ton rôle est les statistiques de l'ANSD.
+- Hors sujet ou information absente de la base (une personne, l'actualité, un autre pays…) : en une ou deux phrases, \
+dis aimablement que tu ne disposes pas de cette information dans les publications de l'ANSD, sans orienter ailleurs ; \
+tu peux inviter à poser une question sur les statistiques du Sénégal.
 """
 
 # ------------------------------------------------------------------ etat d'une reponse
@@ -280,6 +286,15 @@ class _Run:
         """Chiffres de la reponse absents des resultats des outils et de la conversation."""
         known = figures.figure_set(f"{self.tool_text} {allowed}")
         return [f for f in dict.fromkeys(figures.figures(answer)) if f not in known]
+
+    def misattributed_figures(self, answer: str, allowed: str) -> list[str]:
+        """Chiffres de la reponse absents des passages qu'elle cite ([n]) — None a verifier si elle n'en cite aucun."""
+        cited = {int(n) for m in _REF_RE.finditer(answer) for n in re.findall(r"\d+", m.group(1))}
+        cited &= set(self.passages)
+        if not cited:
+            return []
+        known = figures.figure_set(" ".join(self.passages[i]["text"] for i in cited)) | figures.figure_set(allowed)
+        return [f for f in dict.fromkeys(figures.figures(_REF_RE.sub("", answer))) if f not in known]
 
     async def search(self, args: dict) -> str:
         """Execute une recherche et renvoie les passages numerotes, au format lu par le modele."""
@@ -665,8 +680,25 @@ async def agent_events(
                 messages.append({"role": "tool", "tool_call_id": call["id"], "name": call["function"]["name"], "content": result})
             continue
         raw = message["content"].strip()
-        # Garde-fou : un chiffre qui ne figure dans aucun passage obtenu est une invention possible.
+        # Garde-fou : un chiffre qui ne figure dans aucun passage obtenu est une invention possible ;
+        # un chiffre absent des passages que la reponse cite est souvent pris a une autre periode.
         unsupported = run.unsupported_figures(raw, allowed) if raw else []
+        misattributed = [] if unsupported else run.misattributed_figures(raw, allowed)
+        if misattributed and corrections < 2 and not last:
+            corrections += 1
+            if streamed:
+                yield {"type": "reset"}
+            messages.append({"role": "assistant", "content": raw})
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"(Rappel système : {', '.join(misattributed[:6])} ne figure pas dans les passages que tu cites. "
+                    "Vérifie la période et la source de chaque chiffre : cite le passage exact qui le contient, ou "
+                    "retire le chiffre s'il concerne une autre période. Réponds directement à l'utilisateur, sans "
+                    "jamais mentionner ce rappel ni t'excuser.)"
+                ),
+            })
+            continue
         if unsupported and corrections < 2 and not last:
             corrections += 1
             if streamed:

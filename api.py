@@ -328,13 +328,13 @@ def _build_sources() -> list[SourceDocument]:
 
 
 async def _to_french(text: str, timeout: float = 25) -> str:
-    """Wolof -> francais ; le texte tel quel s'il n'est pas du wolof (le service traduirait
+    """Wolof -> francais (Soynade, modele de langage en secours) ; le texte tel quel s'il n'est pas du wolof (le service traduirait
     alors dans l'autre sens) ou si la traduction echoue (la recherche sera moins bonne, mais
     l'utilisateur obtient une reponse)."""
     if not voice.looks_wolof(text):
         return text
     try:
-        return await voice.translate(text, "wo", "fr", timeout=timeout)
+        return await voice.to_french(text, timeout=timeout)
     except voice.VoiceError:
         return text
 

@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import tempfile
+import time
 from collections import OrderedDict
 from pathlib import Path
 
@@ -184,6 +185,7 @@ async def synthesize(text: str, language: str) -> tuple[bytes, str]:
 # a chiffres reviennent souvent en francais, ou avec les annees ecrites en lettres) : toute
 # traduction qui ne conserve pas exactement les chiffres est refusee par `numbers_preserved`.
 TRANSLATE_TIMEOUT = 25
+_blocked_until = 0.0  # Soynade a annonce un quota epuise : pas d'appel avant cet instant (time.monotonic)
 _CACHE_MAX = 2000
 _tr_cache: "OrderedDict[tuple[str, str, str], str]" = OrderedDict()
 _NUMBER_RE = re.compile(r"\d[\d\s  .,]*\d|\d")
@@ -216,6 +218,9 @@ async def translate(text: str, source: str, target: str, timeout: float = TRANSL
     if key in _tr_cache:
         _tr_cache.move_to_end(key)
         return _tr_cache[key]
+    global _blocked_until
+    if time.monotonic() < _blocked_until:
+        raise VoiceError(429, SERVICE_ERROR)  # quota epuise : inutile d'attendre une reponse
     api_key = _api_key()
     for attempt in (0, 1):
         try:
@@ -228,6 +233,17 @@ async def translate(text: str, source: str, target: str, timeout: float = TRANSL
         except httpx.HTTPError:
             logger.warning("soynade: traduction injoignable ou trop lente")
             raise VoiceError(502, SERVICE_ERROR)
+        if resp.status_code == 429:
+            try:
+                retry_after = float(resp.headers.get("retry-after") or 0)
+            except ValueError:
+                retry_after = 0
+            if retry_after > 30:
+                # Quota (journalier) epuise : plus aucun appel jusqu'a l'heure indiquee, le modele de
+                # langage prend le relais sans faire attendre l'utilisateur.
+                _blocked_until = time.monotonic() + retry_after
+                logger.warning("soynade: quota de traduction epuise, suspendu %.0f min", retry_after / 60)
+                raise VoiceError(429, SERVICE_ERROR)
         # Erreur passagere (503, limite de debit) : une seconde tentative apres une courte pause.
         if attempt == 0 and resp.status_code in (429, 502, 503):
             await asyncio.sleep(1.5)
@@ -251,9 +267,11 @@ def _acceptable(source_fr: str, out: str) -> bool:
     return out.strip() != source_fr.strip() and numbers_preserved(source_fr, out) and _french_ratio(out) <= 0.2
 
 
-# Soynade ne traduit pas le vocabulaire statistique (« taux », « population »… reviennent tels quels)
-# et limite le debit (429) : un modele de langage prend alors le relais. Gemini Flash donne le wolof
-# le plus fidele des modeles essayes (gpt-4.1 et claude contresens sur « jëfandikoo »).
+# Reponses (francais -> wolof) : un modele de langage, directement. Soynade ne traduit pas le vocabulaire
+# statistique (« taux », « population »… reviennent tels quels) : l'appeler d'abord coutait du quota et
+# plusieurs secondes pour rien. Gemini Flash donne le wolof le plus fidele des modeles essayes (gpt-4.1
+# et claude font des contresens, ex. « jëfandikoo »). Questions (wolof -> francais) : Soynade, qui les
+# traduit bien, et ce modele en secours (quota epuise, panne).
 WOLOF_LLM_MODEL = os.environ.get("WOLOF_LLM_MODEL", "google/gemini-2.5-flash")
 WOLOF_LLM_TIMEOUT = 40
 _WOLOF_SYSTEM = (
@@ -262,9 +280,16 @@ _WOLOF_SYSTEM = (
     "Garde EXACTEMENT tels quels tous les chiffres et nombres, les annees, les pourcentages, les noms propres, "
     "les sigles (ANSD, RGPH-5…) et les titres de documents. Reponds uniquement par la traduction, sans commentaire."
 )
+_FRENCH_SYSTEM = (
+    "Tu es un traducteur professionnel wolof -> francais. Le texte est une question posee a l'assistant "
+    "statistique de l'ANSD (Senegal). Traduis-le fidelement en francais clair, en gardant tels quels les "
+    "chiffres, les annees, les noms de lieux et les sigles. Si le texte est deja en francais, renvoie-le tel quel. "
+    "Reponds uniquement par la traduction, sans commentaire."
+)
 
 
-async def _llm_translate_to_wolof(text_fr: str) -> str | None:
+async def _llm_translate(system: str, text: str) -> str | None:
+    """Traduction par le modele de langage (OpenRouter). None en cas d'echec."""
     api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
     if not api_key:
         return None
@@ -276,38 +301,53 @@ async def _llm_translate_to_wolof(text_fr: str) -> str | None:
                 "model": WOLOF_LLM_MODEL,
                 "temperature": 0.2,
                 "max_tokens": 1500,
-                "messages": [{"role": "system", "content": _WOLOF_SYSTEM}, {"role": "user", "content": text_fr}],
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": text}],
             },
             timeout=WOLOF_LLM_TIMEOUT,
         )
         resp.raise_for_status()
         out = resp.json()["choices"][0]["message"]["content"]
     except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError):
-        logger.warning("traduction wolof par LLM impossible", exc_info=True)
+        logger.warning("traduction par LLM impossible", exc_info=True)
         return None
     return out.strip() if isinstance(out, str) and out.strip() else None
 
 
-async def to_wolof(text_fr: str) -> str:
-    """Traduction francais -> wolof d'une reponse : Soynade d'abord, puis un modele de langage s'il
-    echoue ou renvoie du francais. Le francais d'origine si aucune traduction ne conserve les chiffres."""
-    try:
-        out = await translate(text_fr, "fr", "wo", timeout=20)
-        if _acceptable(text_fr, out):
-            return out
-    except VoiceError:
-        pass
-    key = ("fr", "wo-llm", text_fr)
+def _cached(key: tuple[str, str, str]) -> str | None:
     if key in _tr_cache:
         _tr_cache.move_to_end(key)
         return _tr_cache[key]
-    out = await _llm_translate_to_wolof(text_fr)
+    return None
+
+
+async def to_wolof(text_fr: str) -> str:
+    """Traduction francais -> wolof d'une reponse, par le modele de langage. Le francais d'origine si
+    la traduction echoue, ne conserve pas les chiffres ou reste trop francaise."""
+    key = ("fr", "wo-llm", text_fr)
+    if (hit := _cached(key)) is not None:
+        return hit
+    out = await _llm_translate(_WOLOF_SYSTEM, text_fr)
     if out and _acceptable(text_fr, out):
-        _tr_cache[key] = out
-        while len(_tr_cache) > _CACHE_MAX:
-            _tr_cache.popitem(last=False)
+        _cache_put("fr", "wo-llm", text_fr, out)
         return out
     return text_fr
+
+
+async def to_french(text_wo: str, timeout: float = TRANSLATE_TIMEOUT) -> str:
+    """Traduction wolof -> francais d'une question : Soynade, puis le modele de langage si Soynade est
+    indisponible (quota, panne). Leve VoiceError si les deux echouent."""
+    try:
+        return await translate(text_wo, "wo", "fr", timeout=timeout)
+    except VoiceError:
+        pass
+    key = ("wo", "fr-llm", text_wo)
+    if (hit := _cached(key)) is not None:
+        return hit
+    out = await _llm_translate(_FRENCH_SYSTEM, text_wo)
+    if not out or not numbers_preserved(text_wo, out):
+        raise VoiceError(502, SERVICE_ERROR)
+    _cache_put("wo", "fr-llm", text_wo, out)
+    return out
 
 
 # Detection grossiere du wolof : le service de traduction retourne le sens inverse (francais ->
