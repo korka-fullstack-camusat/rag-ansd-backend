@@ -122,6 +122,7 @@ def link_references(text: str, hits: list[dict]) -> tuple[str, list[dict]]:
     text = re.sub(r"\[\[(\d+)\]\]", r"[\1]", text)
     linked = _REF_GROUP.sub(replace, text)
     linked = re.sub(r"\s+(\[\[\d+\]\])", r"\1", linked)  # colle la reference au texte
+    linked = re.sub(r"[ \t]+([.,])", r"\1", linked)  # reference retiree : pas d'espace avant « . » ou « , »
     linked = "\n".join(_dedupe_refs(line) for line in linked.split("\n"))
     return linked.strip(), sources
 

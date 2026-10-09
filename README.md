@@ -114,6 +114,27 @@ uvicorn api:app --reload --port 8000   # docs : http://localhost:8000/docs
 ou en Docker : `docker compose up --build`. Variable `CORS_ORIGINS` : URL(s)
 du frontend autorisées. Guide complet de lancement : `../../LANCEMENT.md`.
 
+## Tests
+
+Tout se lance dans l'image Docker du backend (memes dependances qu'en production) :
+
+```bash
+./run_tests.sh               # unitaires + integration : ~120 tests, quelques secondes, sans reseau ni cout
+./run_tests.sh unit          # regles (conversation, conseils, mises en forme, sources), cache, chiffres, analytique, voix
+./run_tests.sh integration   # toutes les routes de l'API, modele de langage et recherche simules
+./run_tests.sh e2e           # bout en bout contre la plateforme lancee (docker compose up -d, backend + frontend)
+./run_tests.sh all           # tout
+./run_tests.sh unit -k cache # options pytest en plus
+```
+
+- `tests/unit/` et `tests/integration/` n'appellent aucun service externe et n'ecrivent jamais
+  dans `storage/analytics.sqlite3` (base temporaire).
+- `tests/e2e/` interroge la vraie plateforme avec le vrai modele (~30 s, quelques centimes) : il
+  verifie la forme des reponses (sources officielles, types de reponse, flux, pages du frontend),
+  pas un texte exact. Variables : `E2E_API_URL`, `E2E_FRONTEND_URL`.
+
+Tests du frontend : `npm test` dans `ANSD-RAG-main`.
+
 ## Montée en charge
 
 Ce qui rend le backend capable de tenir une forte charge :

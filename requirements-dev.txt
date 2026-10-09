@@ -1,0 +1,2 @@
+# Outils de test (en plus de requirements.txt) — voir run_tests.sh
+pytest==8.3.5

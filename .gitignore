@@ -6,3 +6,4 @@ storage/
 data/
 .DS_Store
 *.tar.gz
+.pytest_cache/
